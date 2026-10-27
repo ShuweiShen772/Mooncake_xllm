@@ -962,8 +962,11 @@ std::optional<Replica> MasterService::DescriptorToReplica(
 auto MasterService::RebuildMetadata(const std::vector<KeyReplicaEntry>& entries,
                                     const UUID& client_id)
     -> tl::expected<void, ErrorCode> {
-    std::shared_lock<std::shared_mutex> snap_lock(snapshot_mutex_);
     for (const auto& e : entries) {
+        const auto oid = MakeObjectIdentityForRequest(e.key, e.tenant_id);
+        auto operation_lock =
+            AcquireObjectOperationLock(oid.tenant_id, oid.user_key);
+        std::shared_lock<std::shared_mutex> snap_lock(snapshot_mutex_);
         if (e.replicas.empty())
             return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
         RebuildVersion incoming_version = e.version;
@@ -979,8 +982,14 @@ auto MasterService::RebuildMetadata(const std::vector<KeyReplicaEntry>& entries,
                     std::max(incoming_version,
                              RebuildVersion{buffer.allocation_epoch_, desc.id});
         }
-        const auto oid = MakeObjectIdentityForRequest(e.key, e.tenant_id);
-        MetadataAccessorRW accessor(this, oid);
+        const auto route = GetGroupRoute(oid.tenant_id, oid.user_key);
+        if (route && *route != e.group_id)
+            return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+        const size_t shard_index =
+            e.group_id.empty()
+                ? getMetadataShardIndex(oid.tenant_id, oid.user_key)
+                : getShardIndex(e.group_id);
+        MetadataAccessorRW accessor(this, oid, shard_index);
         if (accessor.Exists()) {
             if (accessor.InProcessing())
                 return tl::make_unexpected(
@@ -1002,9 +1011,14 @@ auto MasterService::RebuildMetadata(const std::vector<KeyReplicaEntry>& entries,
             if (incoming_version < current_version) continue;
             if (incoming_version > current_version) {
                 accessor.Erase();
-            } else if (accessor.Get().size != e.size ||
-                       accessor.Get().group_id != e.group_id) {
-                return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+            } else {
+                const auto& metadata = accessor.Get();
+                SpinLocker pin_lock(&metadata.lock);
+                if (metadata.size != e.size ||
+                    metadata.group_id != e.group_id ||
+                    metadata.IsHardPinned() != e.with_hard_pin ||
+                    metadata.soft_pin_timeout.has_value() != e.with_soft_pin)
+                    return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
             }
         }
         std::vector<Replica> replicas;
@@ -1027,8 +1041,10 @@ auto MasterService::RebuildMetadata(const std::vector<KeyReplicaEntry>& entries,
         }
         if (!accessor.Exists()) {
             accessor.Create(client_id, e.size, std::move(replicas),
-                            /*enable_soft_pin=*/false,
-                            /*enable_hard_pin=*/false, e.data_type, e.group_id);
+                            e.with_soft_pin, e.with_hard_pin, e.data_type,
+                            e.group_id);
+            RegisterGroupMember(accessor.GetTenantState(), oid.tenant_id,
+                                oid.user_key, e.group_id);
         } else {
             accessor.Get().AddReplicas(std::move(replicas));
         }
@@ -1036,9 +1052,63 @@ auto MasterService::RebuildMetadata(const std::vector<KeyReplicaEntry>& entries,
         auto& meta = accessor.Get();
         meta.rebuild_version = incoming_version;
         meta.GrantLease(0, default_kv_soft_pin_ttl_);
+        if (enable_multi_tenants_) {
+            const uint64_t charge = CompletedMemoryQuotaCharge(meta);
+            auto& quota_shard =
+                tenant_quota_shards_[getTenantQuotaShardIndex(oid.tenant_id)];
+            std::lock_guard<std::mutex> quota_lock(quota_shard.mutex);
+            auto& state = quota_shard.tenants.at(oid.tenant_id);
+            const auto previous_charge = meta.committed_quota_charge_bytes;
+            state.used_bytes = SaturatingAdd(
+                state.used_bytes - std::min(state.used_bytes, previous_charge),
+                charge);
+            if (meta.committed_quota_charge_bytes == 0 && charge != 0)
+                ++state.committed_count;
+            meta.committed_quota_charge_bytes = charge;
+            RefreshTenantQuotaOverQuota(state);
+        }
         SyncCacheTotalAccounting(meta);
     }
     return {};
+}
+
+tl::expected<KeyReplicaEntry, ErrorCode>
+MasterService::GetCommittedRebuildEntry(const std::string& key,
+                                        const std::string& tenant_id) {
+    const auto identity = MakeObjectIdentityForRequest(key, tenant_id);
+    auto operation_lock =
+        AcquireObjectOperationLock(identity.tenant_id, identity.user_key);
+    std::shared_lock<std::shared_mutex> snapshot_lock(snapshot_mutex_);
+    MetadataAccessorRW accessor(this, identity);
+    if (!accessor.Exists())
+        return tl::make_unexpected(ErrorCode::OBJECT_NOT_FOUND);
+    if (accessor.InProcessing())
+        return tl::make_unexpected(ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
+    const auto& metadata = accessor.Get();
+    KeyReplicaEntry entry;
+    entry.key = identity.user_key;
+    entry.tenant_id = identity.tenant_id;
+    entry.size = metadata.size;
+    entry.group_id = metadata.group_id;
+    entry.data_type = metadata.data_type;
+    entry.with_hard_pin = metadata.IsHardPinned();
+    {
+        SpinLocker pin_lock(&metadata.lock);
+        entry.with_soft_pin = metadata.soft_pin_timeout.has_value();
+    }
+    entry.version = metadata.rebuild_version;
+    metadata.VisitReplicas(
+        &Replica::fn_is_memory_replica, [&](const Replica& replica) {
+            if (replica.status() != ReplicaStatus::COMPLETE) return;
+            auto descriptor = replica.get_descriptor();
+            const auto& buffer =
+                descriptor.get_memory_descriptor().buffer_descriptor;
+            entry.version = std::max(
+                entry.version,
+                RebuildVersion{buffer.allocation_epoch_, descriptor.id});
+            entry.replicas.emplace_back(std::move(descriptor));
+        });
+    return entry;
 }
 
 auto MasterService::ReMountNoFSegment(const std::vector<NoFSegment>& segments,

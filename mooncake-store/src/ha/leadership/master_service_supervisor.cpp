@@ -203,8 +203,8 @@ void ActivateServingState(MasterAdminServer& admin_server,
     // Two-phase rebuild gate. Phase one allows clients to reconnect and remount
     // during a fixed handshake window, then locks the exact expected client
     // roster. Phase two waits for every expected client to report rebuild
-    // completion. The force timeout opens the store in degraded mode if a client
-    // never completes.
+    // completion. The force timeout opens the store in degraded mode if a
+    // client never completes.
     int window_ms = FLAGS_rebuild_collect_window_ms;
     if (window_ms <= 0) window_ms = 7000;  // Use the built-in 7-second default.
     LOG(INFO) << "[HA-REBUILD-GATE] store CLOSED from construction; "
@@ -446,6 +446,7 @@ int RunSupervisorLoop(const HABackendSpec& spec,
         auto wrapped_config = mooncake::WrappedMasterServiceConfig(
             config, leadership_session->view.view_version);
         wrapped_config.initially_serving = !FLAGS_enable_ha_rebuild_gate;
+        wrapped_config.enable_ha_rebuild = FLAGS_enable_ha_rebuild_gate;
         auto wrapped_master_service = std::make_shared<WrappedMasterService>(
             wrapped_config, config.http_metadata_server,
             config.http_metadata_remote_url);

@@ -356,6 +356,10 @@ class MasterClient {
     [[nodiscard]] tl::expected<void, ErrorCode> RebuildMetadata(
         std::vector<KeyReplicaEntry>&& entries, ViewVersionId view_version);
 
+    [[nodiscard]] tl::expected<KeyReplicaEntry, ErrorCode>
+    GetCommittedRebuildEntry(const std::string& key,
+                             const std::string& tenant_id);
+
     /**
      * @brief Tell the new empty master that this client has resent all
      * metadata. The master starts serving after every expected client reports

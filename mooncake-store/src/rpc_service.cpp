@@ -20,6 +20,7 @@ WrappedMasterService::WrappedMasterService(
     const std::string& http_metadata_remote_url)
     : master_service_(MasterServiceConfig(config)),
       view_version_(config.view_version),
+      enable_ha_rebuild_(config.enable_ha_rebuild),
       serving_state_(config.initially_serving ? StoreServingState::SERVING
                                               : StoreServingState::REBUILDING),
       rebuild_started_at_(std::chrono::steady_clock::now()) {
@@ -867,6 +868,14 @@ tl::expected<void, ErrorCode> WrappedMasterService::ReMountSegment(
         [] { MasterMetricManager::instance().inc_remount_segment_failures(); });
 }
 
+tl::expected<KeyReplicaEntry, ErrorCode>
+WrappedMasterService::GetCommittedRebuildEntry(const std::string& key,
+                                               const std::string& tenant_id) {
+    if (!IsServing())
+        return tl::make_unexpected(ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
+    return master_service_.GetCommittedRebuildEntry(key, tenant_id);
+}
+
 tl::expected<void, ErrorCode> WrappedMasterService::RebuildMetadata(
     const std::vector<KeyReplicaEntry>& entries, const UUID& client_id,
     ViewVersionId view_version) {
@@ -1134,9 +1143,10 @@ tl::expected<CopyStartResponse, ErrorCode> WrappedMasterService::CopyStart(
     const UUID& client_id, const std::string& key, const std::string& tenant_id,
     const std::string& src_segment,
     const std::vector<std::string>& tgt_segments) {
+    if (enable_ha_rebuild_)
+        return tl::make_unexpected(ErrorCode::UNAVAILABLE_IN_CURRENT_MODE);
     if (!IsServing()) {
-        return tl::make_unexpected(
-            ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
+        return tl::make_unexpected(ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
     }
     return execute_rpc(
         "CopyStart",
@@ -1193,9 +1203,10 @@ tl::expected<void, ErrorCode> WrappedMasterService::CopyRevoke(
 tl::expected<MoveStartResponse, ErrorCode> WrappedMasterService::MoveStart(
     const UUID& client_id, const std::string& key, const std::string& tenant_id,
     const std::string& src_segment, const std::string& tgt_segment) {
+    if (enable_ha_rebuild_)
+        return tl::make_unexpected(ErrorCode::UNAVAILABLE_IN_CURRENT_MODE);
     if (!IsServing()) {
-        return tl::make_unexpected(
-            ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
+        return tl::make_unexpected(ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
     }
     return execute_rpc(
         "MoveStart",
@@ -1770,6 +1781,9 @@ void RegisterRpcService(
     server.register_handler<&mooncake::WrappedMasterService::ReMountSegment>(
         &wrapped_master_service);
     server.register_handler<&mooncake::WrappedMasterService::RebuildMetadata>(
+        &wrapped_master_service);
+    server.register_handler<
+        &mooncake::WrappedMasterService::GetCommittedRebuildEntry>(
         &wrapped_master_service);
     server.register_handler<
         &mooncake::WrappedMasterService::SignalRebuildCompleteRpc>(

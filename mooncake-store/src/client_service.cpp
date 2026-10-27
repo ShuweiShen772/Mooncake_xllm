@@ -1568,7 +1568,7 @@ tl::expected<void, ErrorCode> Client::Put(const ObjectKey& key,
         ErrorCode err = start_result.error();
         if (err == ErrorCode::OBJECT_ALREADY_EXISTS) {
             VLOG(1) << "object_already_exists key=" << key;
-            return {};
+            return RecordCommittedReplicas(key, master_client_.tenant_id());
         }
         if (err == ErrorCode::NO_AVAILABLE_HANDLE) {
             LOG(WARNING) << "Failed to start put operation for key=" << key
@@ -1651,21 +1651,12 @@ tl::expected<void, ErrorCode> Client::Put(const ObjectKey& key,
         return tl::unexpected(finalize_decision.error);
     }
 
-    // === HA rebuild: account by owner ===
-    // A replica landing on our own segment -> record locally (we are the
-    // owner). A replica landing on someone else's segment -> notify that owner.
     {
-        uint64_t value_size = 0;
-        for (auto n : slice_lengths) value_size += n;
-        const std::string tenant_id = master_client_.tenant_id();
-        std::string group_id;
-        if (config.group_ids && !config.group_ids->empty())
-            group_id = config.group_ids->front();
-        RecordCommittedReplicas(
-            key, start_result.value(), value_size, config.data_type, group_id,
-            tenant_id,
+        auto recorded = RecordCommittedReplicas(
+            key, master_client_.tenant_id(),
             finalize_decision.end_type == ReplicaType::MEMORY ||
                 finalize_decision.end_type == ReplicaType::ALL);
+        if (!recorded) return recorded;
     }
 
     return {};
@@ -1675,43 +1666,36 @@ tl::expected<void, ErrorCode> Client::Put(const ObjectKey& key,
 // HA rebuild: client-side local replica table helpers
 // ===========================================================================
 
-void Client::RecordCommittedReplicas(
-    const std::string& key, const std::vector<Replica::Descriptor>& replicas,
-    uint64_t size, ObjectDataType data_type, const std::string& group_id,
-    const std::string& tenant_id, bool memory_committed) {
-    if (!enable_ha_rebuild_ || !memory_committed) return;
-    KeyReplicaEntry entry;
-    entry.key = key;
-    entry.tenant_id = tenant_id;
-    entry.size = size;
-    entry.data_type = data_type;
-    entry.group_id = group_id;
-    for (const auto& replica : replicas) {
-        if (!replica.is_memory_replica()) continue;
-        const auto& buffer = replica.get_memory_descriptor().buffer_descriptor;
-        entry.version =
-            std::max(entry.version,
-                     RebuildVersion{buffer.allocation_epoch_, replica.id});
-    }
+tl::expected<void, ErrorCode> Client::RecordCommittedReplicas(
+    const std::string& key, const std::string& tenant_id,
+    bool memory_committed) {
+    if (!enable_ha_rebuild_ || !memory_committed) return {};
+    auto committed = master_client_.GetCommittedRebuildEntry(key, tenant_id);
+    if (!committed) return tl::make_unexpected(committed.error());
+    auto entry = std::move(*committed);
     std::unordered_map<std::string, std::vector<Replica::Descriptor>>
         by_endpoint;
-    for (const auto& replica : replicas) {
+    for (const auto& replica : entry.replicas) {
         if (!replica.is_memory_replica()) continue;
         const auto& endpoint = replica.get_memory_descriptor()
                                    .buffer_descriptor.transport_endpoint_;
-        if (IsMyEndpoint(endpoint)) {
-            std::lock_guard<std::mutex> lock(local_replica_table_mutex_);
-            local_replica_table_.Record(entry, replica);
-        } else {
-            by_endpoint[endpoint].push_back(replica);
-        }
+        by_endpoint[endpoint].push_back(replica);
     }
+    std::vector<uint64_t> request_ids;
+    request_ids.reserve(by_endpoint.size());
     for (auto& [endpoint, owned_replicas] : by_endpoint) {
         entry.replicas = std::move(owned_replicas);
         const std::vector<KeyReplicaEntry> entries{entry};
-        if (!SendUpsertNotify(endpoint, entries))
-            ParkPendingNotify(endpoint, entries);
+        if (IsMyEndpoint(endpoint)) {
+            auto result = ApplyOwnedRebuildEntries(entries);
+            if (!result) return result;
+        } else {
+            request_ids.emplace_back(ParkPendingNotify(endpoint, entries));
+        }
     }
+    if (!request_ids.empty() && !WaitForPendingNotifies(request_ids))
+        return tl::make_unexpected(ErrorCode::RPC_TIMEOUT);
+    return {};
 }
 
 bool Client::IsMyEndpoint(const std::string& ep) {
@@ -1722,13 +1706,15 @@ bool Client::IsMyEndpoint(const std::string& ep) {
     return false;
 }
 
-// Build + base64 + send one UPSERT notify. Returns true iff the peer accepted.
 bool Client::SendUpsertNotify(const std::string& ep,
-                              const std::vector<KeyReplicaEntry>& entries) {
+                              const std::vector<KeyReplicaEntry>& entries,
+                              uint64_t request_id) {
     RebuildNotify n;
     n.sender_client_id = UuidToString(client_id_);
     n.op = RebuildNotifyOp::UPSERT;
     n.entries = entries;
+    n.request_id = request_id;
+    n.reply_endpoint = transfer_engine_->getLocalIpAndPort();
     TransferMetadata::NotifyDesc desc;
     desc.name = n.sender_client_id;
     {
@@ -1746,60 +1732,111 @@ bool Client::SendUpsertNotify(const std::string& ep,
     return true;
 }
 
-void Client::ParkPendingNotify(const std::string& ep,
-                               const std::vector<KeyReplicaEntry>& entries) {
+uint64_t Client::ParkPendingNotify(
+    const std::string& ep, const std::vector<KeyReplicaEntry>& entries) {
     std::lock_guard<std::mutex> lk(pending_notifies_mutex_);
-    auto& bucket = pending_notifies_[ep];
-    bucket.insert(bucket.end(), entries.begin(), entries.end());
+    const uint64_t request_id = next_notify_id_++;
+    pending_notifies_.emplace(request_id, PendingRebuildNotify{ep, entries});
+    return request_id;
 }
 
 void Client::FlushPendingNotifies() {
-    // Snapshot + clear under lock, retry outside lock, re-park what still
-    // fails.
-    std::unordered_map<std::string, std::vector<KeyReplicaEntry>> to_retry;
+    std::unordered_map<uint64_t, PendingRebuildNotify> to_retry;
     {
         std::lock_guard<std::mutex> lk(pending_notifies_mutex_);
         if (pending_notifies_.empty()) return;
-        to_retry.swap(pending_notifies_);
+        to_retry = pending_notifies_;
     }
-    for (auto& [ep, entries] : to_retry) {
-        if (!SendUpsertNotify(ep, entries)) {
-            ParkPendingNotify(ep, entries);  // still down, keep for next tick
+    for (auto& [request_id, pending] : to_retry) {
+        SendUpsertNotify(pending.endpoint, pending.entries, request_id);
+    }
+}
+
+bool Client::WaitForPendingNotifies(const std::vector<uint64_t>& request_ids) {
+    std::unique_lock<std::mutex> lock(pending_notifies_mutex_);
+    return pending_notifies_cv_.wait_for(lock, std::chrono::seconds(30), [&] {
+        if (request_ids.empty()) return pending_notifies_.empty();
+        return std::none_of(request_ids.begin(), request_ids.end(),
+                            [&](uint64_t request_id) {
+                                return pending_notifies_.contains(request_id);
+                            });
+    });
+}
+
+tl::expected<void, ErrorCode> Client::ApplyOwnedRebuildEntries(
+    const std::vector<KeyReplicaEntry>& entries) {
+    for (const auto& entry : entries) {
+        if (entry.replicas.empty())
+            return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+        for (const auto& replica : entry.replicas) {
+            if (!replica.is_memory_replica() ||
+                !IsMyEndpoint(replica.get_memory_descriptor()
+                                  .buffer_descriptor.transport_endpoint_))
+                return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
         }
     }
+    std::lock_guard<std::mutex> lock(local_replica_table_mutex_);
+    std::vector<KeyReplicaEntry> accepted;
+    for (const auto& entry : entries) {
+        auto applied = entry;
+        applied.replicas.clear();
+        for (const auto& replica : entry.replicas) {
+            if (local_replica_table_.Record(entry, replica))
+                applied.replicas.emplace_back(replica);
+        }
+        if (!applied.replicas.empty())
+            accepted.emplace_back(std::move(applied));
+    }
+    if (rebuild_replay_view_ && !accepted.empty())
+        return master_client_.RebuildMetadata(std::move(accepted),
+                                              *rebuild_replay_view_);
+    return {};
 }
 
 // --- notify receive loop -----------------------------------------------------
 void Client::RebuildNotifyLoop() {
     while (rebuild_notify_thread_running_.load()) {
-        // Reliability backstop: retry any notifies whose send previously
-        // failed.
         FlushPendingNotifies();
         std::vector<TransferMetadata::NotifyDesc> notifies;
-        int rc = transfer_engine_->getNotifies(notifies);
+        int rc = rebuild_notifies_paused_.load()
+                     ? -1
+                     : transfer_engine_->getNotifies(notifies);
         if (rc == 0) {
-            for (auto& nd : notifies) {
+            for (auto& notification : notifies) {
                 // Reverse of the send side: base64-decode the JSON-carried
                 // string back to binary, then struct_pack-deserialize.
-                std::string bin = base64::Decode(nd.notify_msg);
+                std::string bin = base64::Decode(notification.notify_msg);
                 RebuildNotify n;
                 auto ec =
                     struct_pack::deserialize_to(n, bin.data(), bin.size());
-                if (ec != struct_pack::errc::ok ||
-                    n.op != RebuildNotifyOp::UPSERT)
-                    continue;
-                for (auto& e : n.entries) {
-                    for (const auto& replica : e.replicas) {
-                        if (!replica.is_memory_replica() ||
-                            !IsMyEndpoint(
-                                replica.get_memory_descriptor()
-                                    .buffer_descriptor.transport_endpoint_))
-                            continue;
-                        std::lock_guard<std::mutex> lock(
-                            local_replica_table_mutex_);
-                        local_replica_table_.Record(e, replica);
+                if (ec != struct_pack::errc::ok) continue;
+                if (n.op == RebuildNotifyOp::ACK) {
+                    if (n.sender_client_id != UuidToString(client_id_))
+                        continue;
+                    std::lock_guard<std::mutex> lock(pending_notifies_mutex_);
+                    auto pending = pending_notifies_.find(n.request_id);
+                    if (pending != pending_notifies_.end() &&
+                        pending->second.endpoint == n.reply_endpoint) {
+                        pending_notifies_.erase(pending);
+                        pending_notifies_cv_.notify_all();
                     }
+                    continue;
                 }
+                if (n.op != RebuildNotifyOp::UPSERT ||
+                    !ApplyOwnedRebuildEntries(n.entries))
+                    continue;
+                RebuildNotify acknowledgement;
+                acknowledgement.sender_client_id = n.sender_client_id;
+                acknowledgement.op = RebuildNotifyOp::ACK;
+                acknowledgement.request_id = n.request_id;
+                acknowledgement.reply_endpoint =
+                    transfer_engine_->getLocalIpAndPort();
+                auto encoded = struct_pack::serialize(acknowledgement);
+                TransferMetadata::NotifyDesc reply;
+                reply.name = UuidToString(client_id_);
+                reply.notify_msg =
+                    base64::Encode(std::string(encoded.begin(), encoded.end()));
+                transfer_engine_->sendNotifyByName(n.reply_endpoint, reply);
             }
         }
         std::this_thread::sleep_for(std::chrono::milliseconds(50));
@@ -1811,11 +1848,9 @@ void Client::RebuildNotifyLoop() {
 // new master via the RebuildMetadata RPC.
 tl::expected<void, ErrorCode> Client::ResendLocalReplicaTable(
     ViewVersionId view_version) {
-    std::vector<KeyReplicaEntry> snapshot;
-    {
-        std::lock_guard<std::mutex> lk(local_replica_table_mutex_);
-        snapshot = local_replica_table_.Snapshot();
-    }
+    std::lock_guard<std::mutex> lock(local_replica_table_mutex_);
+    rebuild_replay_view_ = view_version;
+    auto snapshot = local_replica_table_.Snapshot();
 
     constexpr size_t kBatchSize = 256;
     for (size_t i = 0; i < snapshot.size(); i += kBatchSize) {
@@ -1832,6 +1867,7 @@ tl::expected<void, ErrorCode> Client::ResendLocalReplicaTable(
         }
     }
 
+    rebuild_snapshot_count_.fetch_add(1);
     return {};
 }
 
@@ -1915,14 +1951,8 @@ tl::expected<void, ErrorCode> Client::Upsert(const ObjectKey& key,
         return tl::unexpected(err);
     }
 
-    uint64_t value_size = 0;
-    for (const auto length : slice_lengths) value_size += length;
-    const std::string group_id = config.group_ids && !config.group_ids->empty()
-                                     ? config.group_ids->front()
-                                     : "";
-    RecordCommittedReplicas(key, start_result.value(), value_size,
-                            config.data_type, group_id,
-                            master_client_.tenant_id());
+    auto recorded = RecordCommittedReplicas(key, master_client_.tenant_id());
+    if (!recorded) return recorded;
 
     // Success-side invalidation: a concurrent read between the pre-upsert
     // RemoveHotKey() and UpsertEnd could have read the old value and submitted
@@ -1996,14 +2026,6 @@ class PutOperation {
     std::vector<Slice> slices;
     std::vector<std::vector<Slice>> batched_slices;
 
-    // === HA rebuild: per-key metadata for local-table accounting ===
-    // PutOperation itself has no size/data_type/group_id/tenant_id; filled in
-    // StartBatchPut/StartBatchUpsert from config + slice lengths.
-    uint64_t meta_size{0};
-    ObjectDataType meta_data_type{ObjectDataType::UNKNOWN};
-    std::string meta_group_id;
-    std::string meta_tenant_id{"default"};
-
     // Enhanced state tracking
     PutOperationState state = PutOperationState::PENDING;
     tl::expected<void, ErrorCode> result;
@@ -2018,16 +2040,6 @@ class PutOperation {
     std::optional<std::string> failure_context;
 
     // Helper methods for robust state management
-    void SetRebuildMetadata(const ReplicateConfig& config,
-                            const std::string& tenant_id, size_t index) {
-        meta_size = 0;
-        for (const auto& slice : slices) meta_size += slice.size;
-        meta_data_type = config.data_type;
-        meta_tenant_id = tenant_id;
-        if (config.group_ids && index < config.group_ids->size())
-            meta_group_id = config.group_ids->at(index);
-    }
-
     void SetSuccess() {
         state = PutOperationState::SUCCESS;
         result = {};
@@ -2151,7 +2163,6 @@ void Client::StartBatchPut(std::vector<PutOperation>& ops,
     // Process individual responses with robust error handling
     for (size_t i = 0; i < ops.size(); ++i) {
         ops[i].InitializeRequestedReplicas(config);
-        ops[i].SetRebuildMetadata(config, master_client_.tenant_id(), i);
         if (!start_responses[i]) {
             ops[i].SetTerminalError(start_responses[i].error(),
                                     PutOperationState::MASTER_FAILED,
@@ -2221,7 +2232,6 @@ void Client::StartBatchUpsert(std::vector<PutOperation>& ops,
             ops[i].SetError(start_responses[i].error(),
                             "Master failed to start upsert operation");
         } else {
-            ops[i].SetRebuildMetadata(config, master_client_.tenant_id(), i);
             ops[i].replicas = start_responses[i].value();
             VLOG(1) << "Successfully started upsert for key " << ops[i].key
                     << " with " << ops[i].replicas.size() << " replicas";
@@ -2534,11 +2544,14 @@ void Client::FinalizeBatchPut(std::vector<PutOperation>& ops) {
         }
         if (should_succeed[i]) {
             op.SetSuccess();
-            RecordCommittedReplicas(
-                op.key, op.replicas, op.meta_size, op.meta_data_type,
-                op.meta_group_id, op.meta_tenant_id,
+            auto recorded = RecordCommittedReplicas(
+                op.key, master_client_.tenant_id(),
                 op.transfer_summary.failed_memory_transfers == 0 &&
                     op.transfer_summary.successful_memory_transfers > 0);
+            if (!recorded)
+                op.SetTerminalError(recorded.error(),
+                                    PutOperationState::FINALIZE_FAILED,
+                                    "Ownership acknowledgement failed");
             continue;
         }
         op.SetTerminalError(terminal_errors[i],
@@ -2598,9 +2611,13 @@ void Client::FinalizeBatchUpsert(std::vector<PutOperation>& ops) {
                 } else {
                     ops[op_idx].SetSuccess();
                     const auto& op = ops[op_idx];
-                    RecordCommittedReplicas(op.key, op.replicas, op.meta_size,
-                                            op.meta_data_type, op.meta_group_id,
-                                            op.meta_tenant_id);
+                    auto recorded = RecordCommittedReplicas(
+                        op.key, master_client_.tenant_id());
+                    if (!recorded)
+                        ops[op_idx].SetTerminalError(
+                            recorded.error(),
+                            PutOperationState::FINALIZE_FAILED,
+                            "Ownership acknowledgement failed");
                     finalized_keys.emplace_back(successful_keys[i]);
                     VLOG(1) << "Successfully completed upsert for key "
                             << successful_keys[i];
@@ -2675,7 +2692,8 @@ std::vector<tl::expected<void, ErrorCode>> Client::CollectResults(
             // UpsertStart never returns this error, so this branch is
             // unreachable for BatchUpsert — kept for BatchPut compatibility.
             if (op.result.error() == ErrorCode::OBJECT_ALREADY_EXISTS) {
-                results.back() = {};
+                results.back() =
+                    RecordCommittedReplicas(op.key, master_client_.tenant_id());
                 continue;
             }
             if (op.result.error() == ErrorCode::NO_AVAILABLE_HANDLE) {
@@ -3464,6 +3482,11 @@ tl::expected<void, ErrorCode> Client::Copy(
 tl::expected<void, ErrorCode> Client::Copy(
     const std::string& key, const std::string& tenant_id,
     const std::string& source, const std::vector<std::string>& targets) {
+    if (enable_ha_rebuild_) {
+        LOG(WARNING)
+            << "Copy is unavailable while MC_ENABLE_HA_REBUILD is enabled";
+        return tl::make_unexpected(ErrorCode::UNAVAILABLE_IN_CURRENT_MODE);
+    }
     LOG(INFO) << "action=replica_copy_start" << ", key=" << key
               << ", targets_count=" << targets.size();
 
@@ -3509,6 +3532,11 @@ tl::expected<void, ErrorCode> Client::Copy(
 tl::expected<void, ErrorCode> Client::Move(const std::string& key,
                                            const std::string& source,
                                            const std::string& target) {
+    if (enable_ha_rebuild_) {
+        LOG(WARNING)
+            << "Move is unavailable while MC_ENABLE_HA_REBUILD is enabled";
+        return tl::make_unexpected(ErrorCode::UNAVAILABLE_IN_CURRENT_MODE);
+    }
     return Move(key, master_client_.tenant_id(), source, target);
 }
 
@@ -4007,6 +4035,9 @@ void Client::StorageHeartbeatThreadMain() {
         };
         ops.signal_complete = [&] {
             if (!enable_ha_rebuild_) return tl::expected<void, ErrorCode>{};
+            if (!WaitForPendingNotifies())
+                return tl::expected<void, ErrorCode>{
+                    tl::make_unexpected(ErrorCode::RPC_TIMEOUT)};
             return master_client_.SignalRebuildComplete(view_version);
         };
         auto result = RunRebuildRecovery(ops, kMaxAttempts, wait_before_retry);

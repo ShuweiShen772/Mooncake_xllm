@@ -179,6 +179,9 @@ class MasterService {
                          const UUID& client_id)
         -> tl::expected<void, ErrorCode>;
 
+    tl::expected<KeyReplicaEntry, ErrorCode> GetCommittedRebuildEntry(
+        const std::string& key, const std::string& tenant_id);
+
     /**
      * @brief Re-mount NoF SSD segments, invoked when the client is the first
      * time to connect to the master or the client Ping TTL is expired and need
@@ -1665,11 +1668,14 @@ class MasterService {
     class MetadataAccessorRW {
        public:
         MetadataAccessorRW(MasterService* service,
-                           const ObjectIdentity& object_id)
+                           const ObjectIdentity& object_id,
+                           std::optional<size_t> shard_index = std::nullopt)
             : service_(service),
               object_id_(object_id),
-              shard_idx_(service_->getMetadataShardIndex(object_id_.tenant_id,
-                                                         object_id_.user_key)),
+              shard_idx_(shard_index
+                             ? *shard_index
+                             : service_->getMetadataShardIndex(
+                                   object_id_.tenant_id, object_id_.user_key)),
               shard_guard_(service_, shard_idx_),
               tenant_it_(shard_guard_->tenants.find(object_id_.tenant_id)),
               tenant_state_(tenant_it_ == shard_guard_->tenants.end()

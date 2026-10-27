@@ -163,6 +163,11 @@ struct RpcNameTraits<&WrappedMasterService::RebuildMetadata> {
 };
 
 template <>
+struct RpcNameTraits<&WrappedMasterService::GetCommittedRebuildEntry> {
+    static constexpr const char* value = "GetCommittedRebuildEntry";
+};
+
+template <>
 struct RpcNameTraits<&WrappedMasterService::SignalRebuildCompleteRpc> {
     static constexpr const char* value = "SignalRebuildCompleteRpc";
 };
@@ -822,6 +827,12 @@ tl::expected<void, ErrorCode> MasterClient::ReMountSegment(
         segments, client_id_);
     timer.LogResponseExpected(result);
     return result;
+}
+
+tl::expected<KeyReplicaEntry, ErrorCode> MasterClient::GetCommittedRebuildEntry(
+    const std::string& key, const std::string& tenant_id) {
+    return invoke_rpc<&WrappedMasterService::GetCommittedRebuildEntry,
+                      KeyReplicaEntry>(key, tenant_id);
 }
 
 tl::expected<void, ErrorCode> MasterClient::RebuildMetadata(

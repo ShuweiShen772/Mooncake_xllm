@@ -25,6 +25,20 @@ write share its token. Owners reject older notifications for both object
 identity and overlapping address ranges. The master also selects the newest
 reported write when owners report different versions of an object.
 
+Successful writes wait for each remote owner to apply and acknowledge its
+ownership record. Unacknowledged records remain queued for retry; a write
+returns an error if acknowledgements do not arrive within 30 seconds. Owners
+replay notifications arriving after their recovery snapshot into the current
+master view before acknowledging them. Recovery completion also waits for the
+client's pending acknowledgements.
+
+Ownership records obtain the committed size, group, data type and pin settings
+from the master, including the attributes preserved by Upsert. Rebuild restores
+group routing and membership, pin protection and tenant memory charges.
+Copy and Move return `UNAVAILABLE_IN_CURRENT_MODE` while client rebuild or the
+master rebuild gate is enabled. Their destination ownership protocol is not
+implemented yet; these operations remain available when rebuild is disabled.
+
 The descriptor and notification schemas changed. Deploy matching client and
 master binaries before enabling this feature; mixed-version operation is not
 supported. Data survives only while the segment owner and its memory survive.

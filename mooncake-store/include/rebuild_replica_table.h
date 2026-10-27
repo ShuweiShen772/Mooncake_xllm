@@ -68,9 +68,14 @@ class RebuildReplicaTable {
         }
         ranges_[address] = Range{end, version};
         key_versions_[identity] = version;
-        objects_[identity][address] =
-            LocalReplicaMeta{replica,        entry.size,     entry.data_type,
-                             entry.group_id, identity.first, version};
+        objects_[identity][address] = LocalReplicaMeta{replica,
+                                                       entry.size,
+                                                       entry.data_type,
+                                                       entry.group_id,
+                                                       identity.first,
+                                                       version,
+                                                       entry.with_soft_pin,
+                                                       entry.with_hard_pin};
         addresses_[address] = identity;
         return true;
     }
@@ -88,6 +93,8 @@ class RebuildReplicaTable {
             entry.group_id = metadata.group_id;
             entry.replicas = {metadata.replica};
             entry.version = metadata.version;
+            entry.with_soft_pin = metadata.with_soft_pin;
+            entry.with_hard_pin = metadata.with_hard_pin;
             result.emplace_back(std::move(entry));
         }
         return result;

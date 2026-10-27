@@ -174,6 +174,9 @@ class WrappedMasterService {
         const std::vector<KeyReplicaEntry>& entries, const UUID& client_id,
         ViewVersionId view_version);
 
+    tl::expected<KeyReplicaEntry, ErrorCode> GetCommittedRebuildEntry(
+        const std::string& key, const std::string& tenant_id);
+
     tl::expected<void, ErrorCode> ReMountNoFSegment(
         const std::vector<NoFSegment>& segments, const UUID& client_id);
 
@@ -347,6 +350,7 @@ class WrappedMasterService {
 
     MasterService master_service_;
     const ViewVersionId view_version_;
+    const bool enable_ha_rebuild_;
     std::atomic<StoreServingState> serving_state_;
     const std::chrono::steady_clock::time_point rebuild_started_at_;
 

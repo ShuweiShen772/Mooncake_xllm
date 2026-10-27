@@ -21,6 +21,7 @@
 //     replicas reported by different owners back into two on rebuild.
 
 #include <gtest/gtest.h>
+#include <future>
 #include <glog/logging.h>
 
 #include <chrono>
@@ -230,6 +231,44 @@ TEST_F(ClientMetadataRebuildTest, UpsertCreationAndReplacementSurviveRecovery) {
             GetAndVerify(client_, *allocator_, keys[index], expected[index]));
 }
 
+TEST_F(ClientMetadataRebuildTest, UpsertReplaysAuthoritativePinsAndGroup) {
+    for (const auto& key : {"pinned-inplace", "pinned-resized"}) {
+        const std::string original = "original";
+        void* buffer = allocator_->allocate(original.size());
+        std::memcpy(buffer, original.data(), original.size());
+        std::vector<Slice> slices{Slice{buffer, original.size()}};
+        ReplicateConfig pinned;
+        pinned.with_hard_pin = true;
+        pinned.with_soft_pin = true;
+        pinned.group_ids = std::vector<std::string>{"pin-group"};
+        ASSERT_TRUE(client_->Put(key, slices, pinned));
+        allocator_->deallocate(buffer, original.size());
+        const std::string replacement = std::string(key) == "pinned-inplace"
+                                            ? "replaced"
+                                            : std::string(1024, 'R');
+        buffer = allocator_->allocate(replacement.size());
+        std::memcpy(buffer, replacement.data(), replacement.size());
+        slices = {Slice{buffer, replacement.size()}};
+        ASSERT_TRUE(client_->Upsert(key, slices, ReplicateConfig{}));
+        allocator_->deallocate(buffer, replacement.size());
+    }
+    const auto snapshot = client_->LocalReplicaSnapshotForTest();
+    ASSERT_EQ(snapshot.size(), 2);
+    for (const auto& entry : snapshot) {
+        EXPECT_TRUE(entry.with_hard_pin);
+        EXPECT_EQ(entry.group_id, "pin-group");
+        EXPECT_EQ(entry.with_soft_pin, entry.key == "pinned-resized");
+    }
+    RestartMasterEmpty();
+    ASSERT_TRUE(WaitForAllKeysRebuilt(client_, *allocator_,
+                                      {"pinned-inplace", "pinned-resized"},
+                                      {"replaced", std::string(1024, 'R')}));
+    for (const auto& key : {"pinned-inplace", "pinned-resized"}) {
+        const auto removed = client_->Remove(key);
+        EXPECT_FALSE(removed);
+    }
+}
+
 TEST_F(ClientMetadataRebuildTest,
        BatchUpsertCreationAndReplacementSurviveRecovery) {
     const std::vector<std::string> keys{"batch-created", "batch-inplace",
@@ -375,7 +414,7 @@ TEST_F(ClientMetadataRebuildTest, LazyDelete_RemovedButNotReused_MayRevive) {
 
 // ---------------------------------------------------------------------------
 // Test 4 (cross-client / notify path, the core multi-client scenario):
-// clientA mounts no segment and clientB does, so A's Put data necessarily
+// Client A mounts no segment and client B does, so A's Put data necessarily
 // lands on B's segment because it is the only segment in the global pool.
 // Those keys are recorded on B via an A-to-B notify, and after a master
 // restart B (where the data physically lives) resends them for rebuild. This
@@ -386,7 +425,7 @@ TEST_F(ClientMetadataRebuildTest, LazyDelete_RemovedButNotReused_MayRevive) {
 // pattern in client_integration_test.cpp, where segment_provider_client_
 // mounts and test_client_ only RegisterLocalMemory):
 //   clientB mounts the only allocatable segment.
-//   clientA only RegisterLocalMemory for its local read/write buffer and does
+//   Client A only RegisterLocalMemory for its local read/write buffer and does
 //     not MountSegment.
 // At PutStart the global pool has only B's segment, so data lands on B
 // deterministically and the test is not flaky.
@@ -418,7 +457,7 @@ class ClientCrossNotifyTest : public ::testing::Test {
         ASSERT_TRUE(
             clientB_->MountSegment(segB_, kSeg, FLAGS_protocol).has_value());
 
-        // clientA is the writer and only registers a local read/write buffer;
+        // Client A is the writer and only registers a local read/write buffer;
         // it does not mount a segment.
         auto a = Client::Create("127.0.0.1:19202", "P2PHANDSHAKE",
                                 FLAGS_protocol, std::nullopt, master_address_);
@@ -459,6 +498,36 @@ class ClientCrossNotifyTest : public ::testing::Test {
     void* segB_ = nullptr;
     std::unique_ptr<SimpleAllocator> allocA_, allocB_;
 };
+
+TEST_F(ClientCrossNotifyTest,
+       DelayedOwnershipIsAppliedAfterOwnersFirstSnapshot) {
+    clientB_->PauseRebuildNotifiesForTest(true);
+    const auto before = clientB_->RebuildSnapshotCountForTest();
+    auto put = std::async(std::launch::async, [&] {
+        return PutString(clientA_, *allocA_, "late-notify", "committed-value");
+    });
+    for (int attempt = 0;
+         attempt < 100 && clientA_->PendingNotifyBucketCountForTest() == 0;
+         ++attempt)
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    EXPECT_GT(clientA_->PendingNotifyBucketCountForTest(), 0);
+    EXPECT_EQ(put.wait_for(std::chrono::milliseconds(0)),
+              std::future_status::timeout);
+    EXPECT_TRUE(clientB_->LocalReplicaSnapshotForTest().empty());
+    RestartMasterEmpty();
+    for (int attempt = 0;
+         attempt < 100 && clientB_->RebuildSnapshotCountForTest() == before;
+         ++attempt)
+        std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    EXPECT_GT(clientB_->RebuildSnapshotCountForTest(), before);
+    clientB_->PauseRebuildNotifiesForTest(false);
+    EXPECT_TRUE(put.get());
+    ASSERT_TRUE(WaitForAllKeysRebuilt(clientA_, *allocA_, {"late-notify"},
+                                      {"committed-value"}));
+    EXPECT_TRUE(
+        GetAndVerify(clientB_, *allocB_, "late-notify", "committed-value"));
+    EXPECT_EQ(clientA_->PendingNotifyBucketCountForTest(), 0);
+}
 
 class ClientTenantNotifyTest : public ClientCrossNotifyTest {
    protected:
@@ -627,18 +696,6 @@ TEST_F(ClientCrossNotifyTest, CrossClientRebuildViaNotify) {
 // lost notify makes the owner miss a replica, and that redundancy is silently
 // lost when the master rebuilds.
 // ---------------------------------------------------------------------------
-// Approach (deterministic and reproducible): A first Puts a key normally so
-// the data lands on B's segment, and uses Query to get the real Descriptor
-// pointing at B's segment. Then it uses ParkNotifyForTest to park a notify for
-// a new key headed to B, simulating "this notify originally failed to send".
-// Then:
-//   1. Assert the pending bucket count is 1 (it really was parked).
-//   2. Wait for the background RebuildNotifyLoop's FlushPendingNotifies to
-//      redeliver it, so pending drains to zero.
-//   3. Restart the master and assert that this new key, which was recorded
-//      only thanks to redelivery, can also be resent and rebuilt by B.
-// If the backstop is missing (a failed send is just dropped), pending never
-// drains and the new key never rebuilds, so the test fails.
 TEST_F(ClientCrossNotifyTest, NotifyRetryBackstopRedeliversDroppedNotify) {
     // 1. A Puts a carrier key normally (lands on B's segment) and gets its
     //    real Descriptor pointing at B's segment.
@@ -653,13 +710,8 @@ TEST_F(ClientCrossNotifyTest, NotifyRetryBackstopRedeliversDroppedNotify) {
     const std::string owner_ep = carrier_desc.get_memory_descriptor()
                                      .buffer_descriptor.transport_endpoint_;
 
-    // 2. Simulate "the notify to B originally failed" by parking a notify for
-    //    a new key into pending. Reuse the carrier's Descriptor as this new
-    //    key's replica location; the focus is the redelivery path, not address
-    //    authenticity, and the new key goes through B's RecordLocalReplica so B
-    //    can later resend it.
-    const std::string dropped = "dropped_notify_key";
-    clientA_->ParkNotifyForTest(owner_ep, dropped, carrier_desc,
+    clientB_->PauseRebuildNotifiesForTest(true);
+    clientA_->ParkNotifyForTest(owner_ep, carrier, carrier_desc,
                                 carrier_val.size(), ObjectDataType::UNKNOWN, "",
                                 "default");
 
@@ -667,6 +719,7 @@ TEST_F(ClientCrossNotifyTest, NotifyRetryBackstopRedeliversDroppedNotify) {
     EXPECT_GE(clientA_->PendingNotifyBucketCountForTest(), 1u)
         << "A failed notify should be parked in the pending queue (without the "
            "backstop it would not be parked)";
+    clientB_->PauseRebuildNotifiesForTest(false);
 
     // 2. Wait for the background thread to redeliver, draining pending to zero.
     bool drained = false;
@@ -688,11 +741,9 @@ TEST_F(ClientCrossNotifyTest, NotifyRetryBackstopRedeliversDroppedNotify) {
     // 3. Master crashes and restarts empty.
     RestartMasterEmpty();
 
-    // 3. Assert the dropped key, recorded only thanks to redelivery, can be
-    //    resent and rebuilt by B (the master knows it).
     bool rebuilt = false;
     for (int i = 0; i < 40 && !rebuilt; ++i) {
-        auto qq = clientA_->Query(dropped);
+        auto qq = clientA_->Query(carrier);
         if (qq.has_value() && !qq.value().replicas.empty()) {
             rebuilt = true;
             break;
@@ -700,9 +751,8 @@ TEST_F(ClientCrossNotifyTest, NotifyRetryBackstopRedeliversDroppedNotify) {
         std::this_thread::sleep_for(std::chrono::milliseconds(500));
     }
     EXPECT_TRUE(rebuilt)
-        << "the key for the redelivered notify was not rebuilt: without the "
-           "retry backstop this notify would be lost, the owner would miss the "
-           "record, and the replica would be silently lost on rebuild";
+        << "the committed key was not rebuilt after acknowledged redelivery";
+    EXPECT_TRUE(GetAndVerify(clientB_, *allocB_, carrier, carrier_val));
 }
 
 // ---------------------------------------------------------------------------

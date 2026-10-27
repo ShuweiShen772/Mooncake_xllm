@@ -35,6 +35,25 @@ TEST(RebuildReplicaTableTest, SameKeyInDifferentTenantsSurvives) {
     EXPECT_EQ(snapshot[1].tenant_id, "second");
 }
 
+TEST(RebuildReplicaTableTest, PinAttributesSurviveNotifyAndSnapshot) {
+    auto entry = MakeEntry("default", "pinned", 1024, 128, 1);
+    entry.with_hard_pin = true;
+    entry.with_soft_pin = true;
+    RebuildNotify notify;
+    notify.entries = {entry};
+    const auto bytes = struct_pack::serialize(notify);
+    RebuildNotify decoded;
+    ASSERT_EQ(struct_pack::deserialize_to(decoded, bytes),
+              struct_pack::errc::ok);
+    ASSERT_EQ(decoded.entries.size(), 1);
+    RebuildReplicaTable table;
+    ASSERT_TRUE(table.Record(decoded.entries.front(), entry.replicas.front()));
+    auto snapshot = table.Snapshot();
+    ASSERT_EQ(snapshot.size(), 1);
+    EXPECT_TRUE(snapshot.front().with_soft_pin);
+    EXPECT_TRUE(snapshot.front().with_hard_pin);
+}
+
 TEST(RebuildReplicaTableTest, ParkedNotificationCannotReplaceNewOccupant) {
     RebuildReplicaTable table;
     auto parked = MakeEntry("default", "A", 1024, 128, 1);

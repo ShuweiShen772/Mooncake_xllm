@@ -37,6 +37,30 @@ TEST(HaRebuildGateTest, ConstructorHonorsInitialState) {
     EXPECT_EQ(open.GetServingState(), StoreServingState::SERVING);
 }
 
+TEST(HaRebuildGateTest, RebuildModeRejectsReplicaMigrationBeforeAllocation) {
+    auto config = MakeConfig(true);
+    config.enable_ha_rebuild = true;
+    WrappedMasterService service(config);
+    const auto client_id = generate_uuid();
+    const auto copy =
+        service.CopyStart(client_id, "key", "default", "source", {"target"});
+    ASSERT_FALSE(copy);
+    EXPECT_EQ(copy.error(), ErrorCode::UNAVAILABLE_IN_CURRENT_MODE);
+    const auto move =
+        service.MoveStart(client_id, "key", "default", "source", "target");
+    ASSERT_FALSE(move);
+    EXPECT_EQ(move.error(), ErrorCode::UNAVAILABLE_IN_CURRENT_MODE);
+    WrappedMasterService ordinary(MakeConfig(true));
+    const auto ordinary_copy =
+        ordinary.CopyStart(client_id, "key", "default", "source", {"target"});
+    ASSERT_FALSE(ordinary_copy);
+    EXPECT_EQ(ordinary_copy.error(), ErrorCode::SEGMENT_NOT_FOUND);
+    const auto ordinary_move =
+        ordinary.MoveStart(client_id, "key", "default", "source", "target");
+    ASSERT_FALSE(ordinary_move);
+    EXPECT_EQ(ordinary_move.error(), ErrorCode::SEGMENT_NOT_FOUND);
+}
+
 TEST(HaRebuildGateTest, ExactRosterAndEpochControlOpening) {
     WrappedMasterService service(MakeConfig(false));
     const UUID first{1, 1};

@@ -37,6 +37,29 @@ class MasterSnapshotCodecTest : public ::testing::Test {
                                        service.task_manager_);
     }
 
+    static void ExpectGroupPlacement(MasterService& service,
+                                     const std::string& key,
+                                     const std::string& group) {
+        const size_t shard_index =
+            service.getMetadataShardIndex("default", key);
+        EXPECT_EQ(shard_index, service.getShardIndex(group));
+        EXPECT_NE(shard_index, service.getShardIndex(key));
+        MasterService::MetadataAccessorRW accessor(&service, {"default", key});
+        ASSERT_TRUE(accessor.Exists());
+        EXPECT_EQ(accessor.GetTenantState().group_members.at(group).count(key),
+                  1);
+    }
+
+    static void ExpireLease(MasterService& service, const std::string& key) {
+        MasterService::MetadataAccessorRW accessor(&service, {"default", key});
+        accessor.Get().lease_timeout =
+            std::chrono::system_clock::now() - std::chrono::seconds(1);
+    }
+
+    static void EvictAllEligible(MasterService& service) {
+        service.BatchEvict(1.0, 1.0);
+    }
+
     std::unique_ptr<MasterService> master_service_;
 };
 
@@ -46,6 +69,96 @@ TEST_F(MasterSnapshotCodecTest, EncodeManifestPreservesSnapshotId) {
         MasterSnapshotCodec::kSerializerVersion, "snapshot-000042");
     std::string manifest(bytes.begin(), bytes.end());
     EXPECT_EQ(manifest, "messagepack|1.0.0|snapshot-000042");
+}
+
+TEST_F(MasterSnapshotCodecTest,
+       ClientRebuildRestoresGroupRoutingAndSiblingLeases) {
+    Segment segment;
+    segment.id = generate_uuid();
+    segment.name = "group-rebuild-owner";
+    segment.te_endpoint = segment.name;
+    segment.base = 0x300000000;
+    segment.size = 4096;
+    const auto client_id = generate_uuid();
+    ASSERT_TRUE(master_service_->MountSegment(segment, client_id));
+    const std::string group = "restored-group";
+    std::vector<KeyReplicaEntry> entries;
+    for (const auto& key : {"group-first", "group-second"}) {
+        ReplicateConfig config;
+        config.group_ids = std::vector<std::string>{group};
+        ASSERT_TRUE(
+            master_service_->PutStart(client_id, key, "default", 128, config));
+        ASSERT_TRUE(master_service_->PutEnd(client_id, key, "default",
+                                            ReplicaType::MEMORY));
+        auto entry = master_service_->GetCommittedRebuildEntry(key, "default");
+        ASSERT_TRUE(entry);
+        entries.emplace_back(std::move(*entry));
+    }
+    auto recovered = MakeMasterService();
+    ASSERT_TRUE(recovered->ReMountSegment({segment}, client_id));
+    ASSERT_TRUE(recovered->RebuildMetadata(entries, client_id));
+    for (const auto& entry : entries) {
+        ExpectGroupPlacement(*recovered, entry.key, group);
+        ExpireLease(*recovered, entry.key);
+    }
+    ASSERT_TRUE(recovered->GetReplicaList(entries.front().key, "default"));
+    EXPECT_FALSE(recovered->Remove(entries.back().key, "default", false));
+    MasterSnapshotCodec codec;
+    auto state = MakeStateView(*recovered);
+    auto encoded = codec.Encode(state);
+    ASSERT_TRUE(encoded);
+    auto restored = MakeMasterService();
+    ASSERT_TRUE(codec.Decode(restored.get(), *encoded));
+    for (const auto& entry : entries) {
+        ExpectGroupPlacement(*restored, entry.key, group);
+        ASSERT_TRUE(restored->GetReplicaList(entry.key, "default"));
+    }
+}
+
+TEST_F(MasterSnapshotCodecTest,
+       ClientRebuildPreservesPinProtectionAgainstEviction) {
+    auto config = MasterServiceConfig::builder()
+                      .set_default_kv_lease_ttl(10000)
+                      .set_default_kv_soft_pin_ttl(60000)
+                      .set_allow_evict_soft_pinned_objects(false)
+                      .set_eviction_high_watermark_ratio(1.0)
+                      .build();
+    MasterService recovered(config);
+    Segment segment;
+    segment.id = generate_uuid();
+    segment.name = "pin-rebuild-owner";
+    segment.te_endpoint = segment.name;
+    segment.base = 0x300000000;
+    segment.size = 4096;
+    const auto client_id = generate_uuid();
+    ASSERT_TRUE(master_service_->MountSegment(segment, client_id));
+    std::vector<KeyReplicaEntry> entries;
+    for (const auto& key : {"hard", "soft", "ordinary"}) {
+        ReplicateConfig pin_config;
+        pin_config.with_hard_pin = std::string(key) == "hard";
+        pin_config.with_soft_pin = std::string(key) == "soft";
+        ASSERT_TRUE(master_service_->PutStart(client_id, key, "default", 128,
+                                              pin_config));
+        ASSERT_TRUE(master_service_->PutEnd(client_id, key, "default",
+                                            ReplicaType::MEMORY));
+        auto entry = master_service_->GetCommittedRebuildEntry(key, "default");
+        ASSERT_TRUE(entry);
+        entries.emplace_back(std::move(*entry));
+    }
+    ASSERT_TRUE(recovered.ReMountSegment({segment}, client_id));
+    ASSERT_TRUE(recovered.RebuildMetadata(entries, client_id));
+    for (const auto& entry : entries) ExpireLease(recovered, entry.key);
+    EvictAllEligible(recovered);
+    EXPECT_TRUE(recovered.GetReplicaListForAdmin("hard", "default"));
+    EXPECT_TRUE(recovered.GetReplicaListForAdmin("soft", "default"));
+    EXPECT_FALSE(recovered.GetReplicaListForAdmin("ordinary", "default"));
+    const auto hard = recovered.GetCommittedRebuildEntry("hard", "default");
+    const auto soft = recovered.GetCommittedRebuildEntry("soft", "default");
+    ASSERT_TRUE(hard);
+    ASSERT_TRUE(soft);
+    EXPECT_TRUE(hard->with_hard_pin);
+    EXPECT_TRUE(soft->with_soft_pin);
+    EXPECT_TRUE(recovered.Remove("hard", "default", true));
 }
 
 TEST_F(MasterSnapshotCodecTest, EncodeDecodeRoundTrip) {
