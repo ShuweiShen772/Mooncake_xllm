@@ -25,6 +25,8 @@
 
 #include <chrono>
 #include <cstring>
+#include <filesystem>
+#include <fstream>
 #include <memory>
 #include <string>
 #include <thread>
@@ -36,6 +38,7 @@
 #include "utils.h"  // allocate_buffer_allocator_memory, SimpleAllocator
 #include "test_server_helpers.h"  // InProcMaster, InProcMasterConfigBuilder
 #include "default_config.h"
+#include "tenant_quota_policy_store.h"
 
 DEFINE_string(protocol, "tcp", "Transfer protocol: rdma|tcp");
 
@@ -43,6 +46,41 @@ namespace mooncake {
 namespace testing {
 
 namespace {
+
+class ScopedRebuildSetting {
+   public:
+    ScopedRebuildSetting() {
+        if (const char* value = std::getenv("MC_ENABLE_HA_REBUILD"))
+            previous_ = value;
+    }
+    ~ScopedRebuildSetting() {
+        if (previous_)
+            ::setenv("MC_ENABLE_HA_REBUILD", previous_->c_str(), 1);
+        else
+            ::unsetenv("MC_ENABLE_HA_REBUILD");
+    }
+
+   private:
+    std::optional<std::string> previous_;
+};
+
+TEST(ClientRebuildSwitchTest, DisabledUnlessExplicitlyEnabled) {
+    ScopedRebuildSetting setting;
+    InProcMaster master;
+    ASSERT_TRUE(master.Start(InProcMasterConfigBuilder().build()));
+    for (const std::string value : {"", "0", "1"}) {
+        if (value.empty())
+            ::unsetenv("MC_ENABLE_HA_REBUILD");
+        else
+            ::setenv("MC_ENABLE_HA_REBUILD", value.c_str(), 1);
+        auto client = Client::Create(
+            "127.0.0.1:" + std::to_string(getFreeTcpPort()), "P2PHANDSHAKE",
+            FLAGS_protocol, std::nullopt, master.master_address());
+        ASSERT_TRUE(client);
+        EXPECT_EQ((*client)->IsHaRebuildEnabled(), value == "1");
+        EXPECT_TRUE((*client)->LocalReplicaSnapshotForTest().empty());
+    }
+}
 
 // Wait until all keys can be read back, not just a single probe key.
 // If RebuildMetadata pushes keys one by one instead of atomically, a probe
@@ -61,8 +99,11 @@ bool WaitForAllKeysRebuilt(std::shared_ptr<Client>& client,
             void* buf = allocator.allocate(values[i].size());
             std::vector<Slice> slices{Slice{buf, values[i].size()}};
             auto res = client->Get(keys[i], slices);
+            const bool matches =
+                res && slices.front().size == values[i].size() &&
+                std::memcmp(buf, values[i].data(), values[i].size()) == 0;
             allocator.deallocate(buf, values[i].size());
-            if (!res.has_value()) {
+            if (!matches) {
                 all_ok = false;
                 break;
             }
@@ -166,6 +207,55 @@ class ClientMetadataRebuildTest : public ::testing::Test {
     void* seg_ptr_ = nullptr;
     std::unique_ptr<SimpleAllocator> allocator_;
 };
+
+TEST_F(ClientMetadataRebuildTest, UpsertCreationAndReplacementSurviveRecovery) {
+    const std::vector<std::string> keys{"upsert-created", "upsert-inplace",
+                                        "upsert-resized"};
+    const std::vector<std::string> expected{"created", "new-value",
+                                            std::string(4096, 'R')};
+    ASSERT_TRUE(PutString(client_, *allocator_, keys[1], "old-value"));
+    ASSERT_TRUE(PutString(client_, *allocator_, keys[2], "old"));
+    for (size_t index = 0; index < keys.size(); ++index) {
+        void* buffer = allocator_->allocate(expected[index].size());
+        std::memcpy(buffer, expected[index].data(), expected[index].size());
+        std::vector<Slice> slices{{buffer, expected[index].size()}};
+        auto result = client_->Upsert(keys[index], slices, ReplicateConfig{});
+        allocator_->deallocate(buffer, expected[index].size());
+        ASSERT_TRUE(result) << toString(result.error());
+    }
+    RestartMasterEmpty();
+    ASSERT_TRUE(WaitForAllKeysRebuilt(client_, *allocator_, keys, expected));
+    for (size_t index = 0; index < keys.size(); ++index)
+        EXPECT_TRUE(
+            GetAndVerify(client_, *allocator_, keys[index], expected[index]));
+}
+
+TEST_F(ClientMetadataRebuildTest,
+       BatchUpsertCreationAndReplacementSurviveRecovery) {
+    const std::vector<std::string> keys{"batch-created", "batch-inplace",
+                                        "batch-resized"};
+    const std::vector<std::string> expected{"created", "new-value",
+                                            std::string(4096, 'B')};
+    ASSERT_TRUE(PutString(client_, *allocator_, keys[1], "old-value"));
+    ASSERT_TRUE(PutString(client_, *allocator_, keys[2], "old"));
+    std::vector<std::vector<Slice>> batches;
+    for (const auto& value : expected) {
+        void* buffer = allocator_->allocate(value.size());
+        std::memcpy(buffer, value.data(), value.size());
+        batches.push_back({{buffer, value.size()}});
+    }
+    auto results = client_->BatchUpsert(keys, batches, ReplicateConfig{});
+    for (size_t index = 0; index < batches.size(); ++index)
+        allocator_->deallocate(batches[index].front().ptr,
+                               expected[index].size());
+    ASSERT_EQ(results.size(), keys.size());
+    for (const auto& result : results) ASSERT_TRUE(result);
+    RestartMasterEmpty();
+    ASSERT_TRUE(WaitForAllKeysRebuilt(client_, *allocator_, keys, expected));
+    for (size_t index = 0; index < keys.size(); ++index)
+        EXPECT_TRUE(
+            GetAndVerify(client_, *allocator_, keys[index], expected[index]));
+}
 
 // ---------------------------------------------------------------------------
 // Test 1 (core): after a master restart the client rebuilds object metadata
@@ -309,8 +399,12 @@ TEST_F(ClientMetadataRebuildTest, LazyDelete_RemovedButNotReused_MayRevive) {
 // single-client ClientMetadataRebuildTest.
 class ClientCrossNotifyTest : public ::testing::Test {
    protected:
+    virtual InProcMasterConfig MasterConfig() const {
+        return InProcMasterConfigBuilder().build();
+    }
+
     void SetUp() override {
-        ASSERT_TRUE(master_.Start(InProcMasterConfigBuilder().build()));
+        ASSERT_TRUE(master_.Start(MasterConfig()));
         master_address_ = master_.master_address();
 
         // clientB is the segment owner and mounts the only allocatable
@@ -351,11 +445,10 @@ class ClientCrossNotifyTest : public ::testing::Test {
     void RestartMasterEmpty() {
         master_.Stop();
         std::this_thread::sleep_for(std::chrono::seconds(3));
-        ASSERT_TRUE(master_.Start(
-            InProcMasterConfigBuilder()
-                .set_rpc_port(master_.rpc_port())
-                .set_http_metrics_port(master_.http_metrics_port())
-                .build()));
+        auto config = MasterConfig();
+        config.rpc_port = master_.rpc_port();
+        config.http_metrics_port = master_.http_metrics_port();
+        ASSERT_TRUE(master_.Start(config));
     }
 
     static constexpr size_t kSeg = 128 * 1024 * 1024;
@@ -366,6 +459,117 @@ class ClientCrossNotifyTest : public ::testing::Test {
     void* segB_ = nullptr;
     std::unique_ptr<SimpleAllocator> allocA_, allocB_;
 };
+
+class ClientTenantNotifyTest : public ClientCrossNotifyTest {
+   protected:
+    void SetUp() override {
+        policy_path_ = (std::filesystem::temp_directory_path() /
+                        ("mooncake-rebuild-tenants-" +
+                         UuidToString(generate_uuid()) + ".yaml"))
+                           .string();
+        TenantQuotaPolicySnapshot policy;
+        policy.tenant_quotas = {
+            {"default", kSeg}, {"tenant-a", kSeg}, {"tenant-b", kSeg}};
+        std::ofstream output(policy_path_);
+        output << FormatTenantQuotaPolicyYaml(policy);
+        output.close();
+        ClientCrossNotifyTest::SetUp();
+    }
+
+    void TearDown() override {
+        ClientCrossNotifyTest::TearDown();
+        std::filesystem::remove(policy_path_);
+    }
+
+    InProcMasterConfig MasterConfig() const override {
+        auto config = ClientCrossNotifyTest::MasterConfig();
+        config.enable_multi_tenants = true;
+        config.tenant_quota_connector_uri = policy_path_;
+        return config;
+    }
+
+    std::string policy_path_;
+};
+
+TEST_F(ClientTenantNotifyTest, SameKeyFromTwoTenantsSurvivesOnSharedOwner) {
+    std::vector<std::shared_ptr<Client>> writers;
+    const std::vector<std::string> tenants{"tenant-a", "tenant-b"};
+    const std::vector<std::string> values{std::string(1024, 'A'),
+                                          std::string(1024, 'B')};
+    for (size_t index = 0; index < tenants.size(); ++index) {
+        auto writer =
+            Client::Create("127.0.0.1:" + std::to_string(getFreeTcpPort()),
+                           "P2PHANDSHAKE", FLAGS_protocol, std::nullopt,
+                           master_address_, nullptr, {}, tenants[index]);
+        ASSERT_TRUE(writer);
+        writers.push_back(*writer);
+        ASSERT_TRUE(writers.back()->RegisterLocalMemory(
+            allocA_->getBase(), kAlloc, "cpu:0", false, false));
+        ASSERT_TRUE(
+            PutString(writers.back(), *allocA_, "shared-key", values[index]));
+    }
+    for (int attempt = 0; attempt < 100; ++attempt) {
+        if (clientB_->LocalReplicaSnapshotForTest().size() == 2) break;
+        std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    }
+    ASSERT_EQ(clientB_->LocalReplicaSnapshotForTest().size(), 2);
+    RestartMasterEmpty();
+    for (size_t index = 0; index < writers.size(); ++index) {
+        ASSERT_TRUE(WaitForAllKeysRebuilt(writers[index], *allocA_,
+                                          {"shared-key"}, {values[index]}));
+        EXPECT_TRUE(GetAndVerify(writers[index], *allocA_, "shared-key",
+                                 values[index]));
+    }
+}
+
+TEST_F(ClientCrossNotifyTest, ReorderedRetryCannotResurrectReusedAddress) {
+    const std::string value_a(4096, 'A');
+    const std::string value_b(4096, 'B');
+    ASSERT_TRUE(PutString(clientA_, *allocA_, "parked-A", value_a));
+    auto original = clientA_->Query("parked-A");
+    ASSERT_TRUE(original);
+    const auto descriptor = original->replicas.front();
+    ASSERT_TRUE(clientA_->Remove("parked-A", true));
+    ASSERT_TRUE(PutString(clientA_, *allocA_, "live-B", value_b));
+    auto replacement = clientA_->Query("live-B");
+    ASSERT_TRUE(replacement);
+    ASSERT_EQ(
+        descriptor.get_memory_descriptor().buffer_descriptor.buffer_address_,
+        replacement->replicas.front()
+            .get_memory_descriptor()
+            .buffer_descriptor.buffer_address_);
+    bool received = false;
+    for (int attempt = 0; attempt < 100; ++attempt) {
+        const auto snapshot = clientB_->LocalReplicaSnapshotForTest();
+        if (snapshot.size() == 1 && snapshot.front().key == "live-B") {
+            received = true;
+            break;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    }
+    ASSERT_TRUE(received);
+    const auto& endpoint = descriptor.get_memory_descriptor()
+                               .buffer_descriptor.transport_endpoint_;
+    clientA_->ParkNotifyForTest(endpoint, "parked-A", descriptor,
+                                value_a.size(), ObjectDataType::UNKNOWN, "",
+                                "default");
+    for (int attempt = 0; attempt < 100; ++attempt) {
+        if (clientA_->PendingNotifyBucketCountForTest() == 0) break;
+        std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    }
+    ASSERT_EQ(clientA_->PendingNotifyBucketCountForTest(), 0);
+    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    const auto snapshot = clientB_->LocalReplicaSnapshotForTest();
+    ASSERT_EQ(snapshot.size(), 1);
+    EXPECT_EQ(snapshot.front().key, "live-B");
+    RestartMasterEmpty();
+    ASSERT_TRUE(
+        WaitForAllKeysRebuilt(clientA_, *allocA_, {"live-B"}, {value_b}));
+    EXPECT_TRUE(GetAndVerify(clientA_, *allocA_, "live-B", value_b));
+    auto stale = clientA_->Query("parked-A");
+    ASSERT_FALSE(stale);
+    EXPECT_EQ(stale.error(), ErrorCode::OBJECT_NOT_FOUND);
+}
 
 TEST_F(ClientCrossNotifyTest, CrossClientRebuildViaNotify) {
     const int kNumKeys = 30;

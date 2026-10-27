@@ -15,6 +15,7 @@
 #include <unordered_set>
 
 #include "client_metric.h"
+#include "rebuild_replica_table.h"
 #include "ha/leadership/leader_coordinator.h"
 #include "master_client.h"
 #include "storage_backend.h"
@@ -67,6 +68,12 @@ class Client {
 
     const UUID& getClientId() const { return client_id_; }
     const std::string& tenant_id() const { return master_client_.tenant_id(); }
+    bool IsHaRebuildEnabled() const { return enable_ha_rebuild_; }
+
+    std::vector<KeyReplicaEntry> LocalReplicaSnapshotForTest() const {
+        std::lock_guard<std::mutex> lock(local_replica_table_mutex_);
+        return local_replica_table_.Snapshot();
+    }
 
     // --- test-only helpers for the notify-reliability backstop ---
     // Number of endpoints with parked (failed, awaiting-retry) notifies.
@@ -803,41 +810,22 @@ class Client {
     ReplicateConfig AttachHostId(const ReplicateConfig& config) const;
 
     // === HA rebuild: client-side helpers (impl in client_service.cpp) ===
-    // Record a replica physically located in this client's own segment. Called
-    // both when this client Put()s onto its own segment and when an UPSERT
-    // notify arrives. Internally address-overwrites the stale key at the same
-    // address.
-    void RecordLocalReplica(const std::string& key,
-                            const Replica::Descriptor& replica, uint64_t size,
-                            ObjectDataType data_type,
-                            const std::string& group_id,
-                            const std::string& tenant_id);
-    // Evict the stale key occupying `addr` (it was just reused). Caller must
-    // hold local_replica_table_mutex_.
-    void EraseByAddressLocked(uint64_t addr);
+    void RecordCommittedReplicas(
+        const std::string& key,
+        const std::vector<Replica::Descriptor>& replicas, uint64_t size,
+        ObjectDataType data_type, const std::string& group_id,
+        const std::string& tenant_id, bool memory_committed = true);
     // Is `ep` one of THIS client's mounted segments' te_endpoint? (Never
     // compare against local_hostname_ -- a segment's te_endpoint =
     // getLocalIpAndPort().)
     bool IsMyEndpoint(const std::string& ep);
-    // Tell the segment owner at `ep` that we stored `key` there (full
-    // metadata).
-    void NotifyOwnerUpsert(const std::string& ep, const std::string& key,
-                           const Replica::Descriptor& replica, uint64_t size,
-                           ObjectDataType data_type,
-                           const std::string& group_id,
-                           const std::string& tenant_id);
-    // Batched notify: pack multiple keys landing on the same endpoint into one
-    // notify (BatchPut high-throughput optimization).
-    void NotifyOwnerUpsertBatch(
-        const std::unordered_map<std::string, std::vector<KeyReplicaEntry>>&
-            by_ep);
     // On reconnect, resend the whole local table to the (empty) new master.
     tl::expected<void, ErrorCode> ResendLocalReplicaTable(
         ViewVersionId view_version);
     // Background loop: poll getNotifies() and apply UPSERT entries.
     void RebuildNotifyLoop();
     // Send one UPSERT notify carrying `entries` to endpoint `ep`. Returns true
-    // on success. Shared by NotifyOwnerUpsert and the pending re-send path.
+    // on success. Shared by committed writes and the pending re-send path.
     bool SendUpsertNotify(const std::string& ep,
                           const std::vector<KeyReplicaEntry>& entries);
     // Park a failed notify for later re-send (reliability backstop).
@@ -861,21 +849,9 @@ class Client {
     mutable std::mutex mounted_segments_mutex_;
     std::unordered_map<UUID, Segment, boost::hash<UUID>> mounted_segments_;
 
-    // === HA rebuild: local replica table ===
-    // Maps a key physically stored in THIS client's segment -> its replica
-    // location + rebuild metadata. Filled two ways: (1) this client Put()s and
-    // a replica lands on its own segment; (2) an UPSERT notify arrives from
-    // another client. Value is LocalReplicaMeta (single replica, see
-    // rebuild_types.h): a key's multiple replicas are forced onto different
-    // segments, so from one client's view a key has at most one replica in its
-    // own segment.
+    bool enable_ha_rebuild_{false};
     mutable std::mutex local_replica_table_mutex_;
-    std::unordered_map<std::string, LocalReplicaMeta> local_replica_table_;
-    // Address reverse index: buffer_address_ -> key, for the same client's
-    // segments. Core of lazy-delete: when an address is reused, locate and
-    // evict the stale key entry occupying it (see RecordLocalReplica). Same
-    // mutex as local_replica_table_.
-    std::unordered_map<uint64_t, std::string> addr_index_;
+    RebuildReplicaTable local_replica_table_;
     std::atomic<bool> rebuild_notify_thread_running_{false};
     std::thread rebuild_notify_thread_;  // polls getNotifies()
     // Reliability backstop: UPSERT notifies whose send failed (peer flapping /

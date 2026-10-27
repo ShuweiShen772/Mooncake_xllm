@@ -125,6 +125,81 @@ TEST_F(MasterSnapshotCodecTest, EncodeDecodeRoundTripWithMemoryReplica) {
     EXPECT_EQ(get_result.value().replicas.size(), 1u);
 }
 
+TEST_F(MasterSnapshotCodecTest,
+       RebuildWriteVersionSurvivesSnapshotAndNewEpoch) {
+    master_service_ = std::make_unique<MasterService>(
+        MasterServiceConfig::builder().set_view_version(42).build());
+    Segment segment;
+    segment.id = generate_uuid();
+    segment.name = "rebuild-snapshot-owner";
+    segment.te_endpoint = segment.name;
+    segment.base = 0x300000000;
+    segment.size = 16 * 1024 * 1024;
+    const UUID owner = generate_uuid();
+    ASSERT_TRUE(master_service_->ReMountSegment({segment}, owner));
+    KeyReplicaEntry entry;
+    entry.key = "rebuild-key";
+    entry.size = 1024;
+    entry.version = {42, 100};
+    Replica::Descriptor replica;
+    replica.id = 10;
+    replica.status = ReplicaStatus::COMPLETE;
+    MemoryDescriptor memory;
+    memory.buffer_descriptor = {1024, segment.base, "tcp", segment.te_endpoint,
+                                42,   1024};
+    replica.descriptor_variant = memory;
+    entry.replicas = {replica};
+    ASSERT_TRUE(master_service_->RebuildMetadata({entry}, owner));
+    MasterSnapshotCodec codec;
+    auto state = MakeStateView(*master_service_);
+    const auto encoded = codec.Encode(state);
+    ASSERT_TRUE(encoded) << encoded.error().message;
+    auto target = std::make_unique<MasterService>(
+        MasterServiceConfig::builder().set_view_version(43).build());
+    ASSERT_TRUE(codec.Decode(target.get(), *encoded));
+    auto before = target->GetReplicaList(entry.key, "default");
+    ASSERT_TRUE(before);
+    EXPECT_EQ(before->replicas.front().id, 10);
+    EXPECT_EQ(before->replicas.front()
+                  .get_memory_descriptor()
+                  .buffer_descriptor.allocation_epoch_,
+              42);
+    auto stale = entry;
+    stale.version = {42, 99};
+    stale.replicas.front().id = 99;
+    std::get<MemoryDescriptor>(stale.replicas.front().descriptor_variant)
+        .buffer_descriptor.buffer_address_ += 1024;
+    ASSERT_TRUE(target->RebuildMetadata({stale}, owner));
+    auto unchanged = target->GetReplicaList(entry.key, "default");
+    ASSERT_TRUE(unchanged);
+    EXPECT_EQ(unchanged->replicas.front().id, 10);
+    auto latest = stale;
+    latest.version = {42, 101};
+    latest.replicas.front().id = 101;
+    ASSERT_TRUE(target->RebuildMetadata({latest}, owner));
+    auto after = target->GetReplicaList(entry.key, "default");
+    ASSERT_TRUE(after);
+    EXPECT_EQ(after->replicas.front().id, 101);
+    EXPECT_EQ(after->replicas.front()
+                  .get_memory_descriptor()
+                  .buffer_descriptor.buffer_address_,
+              segment.base + 1024);
+    auto upsert = target->UpsertStart(owner, entry.key, "default", 1024,
+                                      ReplicateConfig{});
+    ASSERT_TRUE(upsert);
+    EXPECT_GT(upsert->front().id, 101);
+    EXPECT_EQ(upsert->front()
+                  .get_memory_descriptor()
+                  .buffer_descriptor.allocation_epoch_,
+              43);
+    ASSERT_TRUE(
+        target->UpsertEnd(owner, entry.key, "default", ReplicaType::MEMORY));
+    ASSERT_TRUE(target->RebuildMetadata({latest}, owner));
+    auto committed = target->GetReplicaList(entry.key, "default");
+    ASSERT_TRUE(committed);
+    EXPECT_EQ(committed->replicas.front().id, upsert->front().id);
+}
+
 TEST_F(MasterSnapshotCodecTest, DecodeWithCorruptPayloadFails) {
     MasterSnapshotCodec codec;
 

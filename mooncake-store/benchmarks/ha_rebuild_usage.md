@@ -1,0 +1,44 @@
+# Client metadata rebuild
+
+Metadata rebuild is opt-in. The master flag `--enable_ha_rebuild_gate` defaults
+to `false`. Clients leave ownership tracking, notifications, and metadata replay
+disabled unless `MC_ENABLE_HA_REBUILD=1` is set before creating the client. The
+same environment setting applies to xLLM's `MooncakeStoreBackend` through
+`RealClient`.
+
+Enable both sides for HA deployments:
+
+```bash
+export MC_ENABLE_HA_REBUILD=1
+mooncake_master --enable_ha=true --enable_ha_rebuild_gate=true <other-master-options>
+```
+
+Set the environment variable on every client, including clients that only own
+segments. Restart clients after changing it. Enabling only the master gate can
+leave recovery waiting for disabled clients until the degraded-service timeout.
+Non-HA restart tests enable the client setting while leaving the master gate off.
+
+Recovery currently imports memory replicas managed by the offset allocator.
+Descriptors carry the original allocation extent and a master-issued ordering
+token derived from the HA view and replica IDs. All replicas reported for one
+write share its token. Owners reject older notifications for both object
+identity and overlapping address ranges. The master also selects the newest
+reported write when owners report different versions of an object.
+
+The descriptor and notification schemas changed. Deploy matching client and
+master binaries before enabling this feature; mixed-version operation is not
+supported. Data survives only while the segment owner and its memory survive.
+The existing lazy-delete behavior remains: a removed object whose address has
+not been reused may reappear after rebuilding metadata. This mechanism does not
+provide durable deletion or persist data across owner failure.
+
+Run the focused regressions with:
+
+```bash
+ctest --test-dir build --output-on-failure -R \
+  '^(offset_allocator_test|rebuild_replica_table_test|master_rebuild_replay_test|client_metadata_rebuild_test|ha_rebuild_gate_test|rebuild_retry_test)$'
+```
+
+CTest enables `MC_ENABLE_HA_REBUILD=1` for `client_metadata_rebuild_test`; set it
+explicitly when running that binary directly. The live-test and scale-test
+drivers also enable it explicitly.

@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+export MC_ENABLE_HA_REBUILD=1
 # HA scale benchmark driver. For each --nkeys in the sweep:
 #   1. start a fresh mooncake_master (non-HA) on $MASTER_PORT
 #   2. start ha_scale_bench_main -> mounts a segment, BatchPuts N keys,

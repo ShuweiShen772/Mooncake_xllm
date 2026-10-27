@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+export MC_ENABLE_HA_REBUILD=1
 # Live HA recovery test (out-of-process):
 #   Drives ha_recovery_live_main against a REAL, separate mooncake_master
 #   PROCESS. Verifies that after the master is killed and restarted on the same

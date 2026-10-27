@@ -91,6 +91,8 @@ add_store_test(transfer_task_test transfer_task_test.cpp)
 add_store_test(tenant_quota_test tenant_quota_test.cpp)
 add_store_test(segment_test segment_test.cpp)
 add_store_test(offset_allocator_test offset_allocator_test.cpp)
+add_store_test(rebuild_replica_table_test rebuild_replica_table_test.cpp)
+add_store_test(master_rebuild_replay_test master_rebuild_replay_test.cpp)
 add_store_test(utils_test utils_test.cpp)
 add_store_test(client_buffer_test client_buffer_test.cpp)
 add_store_test(client_local_hot_cache_test client_local_hot_cache_test.cpp)
@@ -118,6 +120,8 @@ add_store_test(master_service_test_for_snapshot
                ha/snapshot/master_service_test_for_snapshot.cpp)
 add_store_test(non_ha_reconnect_test non_ha_reconnect_test.cpp)
 add_store_test(client_metadata_rebuild_test client_metadata_rebuild_test.cpp)
+set_tests_properties(client_metadata_rebuild_test
+                     PROPERTIES ENVIRONMENT "MC_ENABLE_HA_REBUILD=1")
 # Live HA recovery test: standalone client (own main, no gtest) connecting to a
 # real separate mooncake_master process. Driven by ha_live_test.sh.
 add_executable(ha_recovery_live_main ha_recovery_live_main.cpp)

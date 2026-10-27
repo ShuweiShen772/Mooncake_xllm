@@ -435,8 +435,10 @@ class SegmentManager {
      */
     explicit SegmentManager(
         BufferAllocatorType memory_allocator = BufferAllocatorType::CACHELIB,
-        bool enable_cxl = false)
-        : memory_allocator_(memory_allocator), enable_cxl_(enable_cxl) {}
+        bool enable_cxl = false, ViewVersionId allocation_epoch = 0)
+        : memory_allocator_(memory_allocator),
+          enable_cxl_(enable_cxl),
+          allocation_epoch_(allocation_epoch) {}
 
     /**
      * @brief Get RAII-style access to segment management operations
@@ -473,6 +475,7 @@ class SegmentManager {
     // This singleton allocator is managed by the master
     // Used for unified allocation and recycling of CXL shared memory.
     const bool enable_cxl_;
+    const ViewVersionId allocation_epoch_;
     std::shared_ptr<BufferAllocatorBase> cxl_global_allocator_;
     // allocator_manager_ only contains allocators whose segment status is OK.
     AllocatorManager allocator_manager_;

@@ -21,16 +21,14 @@
 #include "master_metric_manager.h"
 #include "rpc_service.h"
 
-// Master switch for the HA rebuild gate. It defaults to enabled; disabling it
-// makes a promoted leader serve immediately as an emergency rollback. Non-HA
-// and single-master deployments are unaffected. When enabled, the leader closes
-// normal store traffic, collects reconnecting clients, waits for their rebuild
-// completion signals, and then opens the store. The timing flags below are
-// optional advanced settings that only apply when this switch is enabled.
-DEFINE_bool(enable_ha_rebuild_gate, true,
+// Master switch for the HA rebuild gate. It defaults to disabled; enabling it
+// makes a promoted leader wait for client metadata rebuild before serving.
+// Non-HA and single-master deployments are unaffected. The timing flags below
+// are optional advanced settings that only apply when this switch is enabled.
+DEFINE_bool(enable_ha_rebuild_gate, false,
             "HA: master feature switch; when true, close store service on "
             "promotion and only open after client metadata rebuild completes "
-            "(two-phase). true (default); false = serve immediately (rollback)");
+            "(two-phase). false (default); true enables the rebuild gate");
 
 // Handshake window after promotion, in milliseconds. While the window is
 // active, normal store traffic remains closed and recovery RPCs such as

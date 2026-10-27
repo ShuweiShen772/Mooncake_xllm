@@ -1264,6 +1264,8 @@ inline MasterServiceConfigBuilder MasterServiceConfig::builder() {
 
 // Configuration for InProcMaster (in-process master server for testing)
 struct InProcMasterConfig {
+    bool enable_multi_tenants{false};
+    std::string tenant_quota_connector_uri;
     std::optional<int> rpc_port;
     std::optional<int> http_metrics_port;
     std::optional<int> http_metadata_port;

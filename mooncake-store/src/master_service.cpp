@@ -200,7 +200,8 @@ MasterService::MasterService(const MasterServiceConfig& config)
       enable_multi_tenants_(config.enable_multi_tenants),
       tenant_quota_connector_type_(config.tenant_quota_connector_type),
       tenant_quota_connector_uri_(config.tenant_quota_connector_uri),
-      segment_manager_(config.memory_allocator, config.enable_cxl),
+      segment_manager_(config.memory_allocator, config.enable_cxl,
+                       config.view_version),
       nof_segment_manager_(config.memory_allocator),
       memory_allocator_type_(config.memory_allocator),
       allocation_strategy_type_(config.enable_cxl
@@ -908,23 +909,24 @@ namespace {
 // (endpoint,address) identity of a memory replica; used for merge de-dup.
 // get_descriptor() returns Descriptor BY VALUE, so bind it to a named var
 // first -- taking a reference into a temporary would dangle.
-bool RebuildSameMemoryLocation(const Replica& a, const Replica& b) {
+bool RebuildSameMemoryLocation(const Replica::Descriptor& a,
+                               const Replica::Descriptor& b) {
     if (!a.is_memory_replica() || !b.is_memory_replica()) return false;
-    const Replica::Descriptor da_desc = a.get_descriptor();
-    const Replica::Descriptor db_desc = b.get_descriptor();
-    const auto& da = da_desc.get_memory_descriptor().buffer_descriptor;
-    const auto& db = db_desc.get_memory_descriptor().buffer_descriptor;
+    const auto& da = a.get_memory_descriptor().buffer_descriptor;
+    const auto& db = b.get_memory_descriptor().buffer_descriptor;
     return da.transport_endpoint_ == db.transport_endpoint_ &&
-           da.buffer_address_ == db.buffer_address_;
+           da.buffer_address_ == db.buffer_address_ && da.size_ == db.size_ &&
+           da.allocation_size_ == db.allocation_size_;
 }
 }  // namespace
 
-bool MasterService::ReplicaAlreadyPresent(const ObjectMetadata& meta,
-                                          const Replica& r) const {
+bool MasterService::ReplicaAlreadyPresent(
+    const ObjectMetadata& meta, const Replica::Descriptor& descriptor) const {
     bool found = false;
     meta.VisitReplicas([](const Replica&) { return true; },
                        [&](const Replica& existing) {
-                           if (RebuildSameMemoryLocation(existing, r))
+                           if (RebuildSameMemoryLocation(
+                                   existing.get_descriptor(), descriptor))
                                found = true;
                        });
     return found;
@@ -932,55 +934,29 @@ bool MasterService::ReplicaAlreadyPresent(const ObjectMetadata& meta,
 
 std::optional<Replica> MasterService::DescriptorToReplica(
     const Replica::Descriptor& desc) {
-    return std::visit(
-        [&](auto&& d) -> std::optional<Replica> {
-            using T = std::decay_t<decltype(d)>;
-            if constexpr (std::is_same_v<T, MemoryDescriptor>) {
-                const auto& bd = d.buffer_descriptor;
-                // Find owning segment's allocator by endpoint + address range.
-                std::shared_ptr<BufferAllocatorBase> base_alloc;
-                {
-                    auto seg_access = segment_manager_.getSegmentAccess();
-                    base_alloc = seg_access.FindAllocatorByEndpointAndAddr(
-                        bd.transport_endpoint_, bd.buffer_address_);
-                }
-                if (!base_alloc) {
-                    LOG(WARNING) << "rebuild: no OK segment for endpoint="
-                                 << bd.transport_endpoint_
-                                 << " addr=" << bd.buffer_address_;
-                    return std::nullopt;
-                }
-                // Method-1 (allocate-placeholder + rebind addr) is only safe on
-                // OffsetBufferAllocator (deallocate frees via offset_handle,
-                // not buffer_ptr). Cachelib would double-free -> refuse for
-                // now.
-                auto offset_alloc =
-                    std::dynamic_pointer_cast<OffsetBufferAllocator>(
-                        base_alloc);
-                if (!offset_alloc) {
-                    LOG(WARNING) << "rebuild: segment allocator is not "
-                                    "OffsetBufferAllocator; skip key rebuild";
-                    return std::nullopt;
-                }
-                auto buffer = offset_alloc->AllocateForRebuild(
-                    bd.size_, reinterpret_cast<void*>(bd.buffer_address_));
-                if (!buffer) {
-                    LOG(WARNING) << "rebuild: AllocateForRebuild failed size="
-                                 << bd.size_;
-                    return std::nullopt;
-                }
-                return Replica(std::move(buffer), ReplicaStatus::COMPLETE);
-            } else if constexpr (std::is_same_v<T, DiskDescriptor>) {
-                return Replica(d.file_path, d.object_size,
-                               ReplicaStatus::COMPLETE);
-            } else if constexpr (std::is_same_v<T, LocalDiskDescriptor>) {
-                return Replica(d.client_id, d.object_size, d.transport_endpoint,
-                               ReplicaStatus::COMPLETE);
-            }
-            // NoFDescriptor or others: not rebuilt in the first version.
-            return std::nullopt;
-        },
-        desc.descriptor_variant);
+    if (!desc.is_memory_replica()) return std::nullopt;
+    const auto& descriptor = desc.get_memory_descriptor().buffer_descriptor;
+    std::shared_ptr<BufferAllocatorBase> allocator;
+    {
+        auto segments = segment_manager_.getSegmentAccess();
+        allocator = segments.FindAllocatorByEndpointAndAddr(
+            descriptor.transport_endpoint_, descriptor.buffer_address_);
+    }
+    auto offset_allocator =
+        std::dynamic_pointer_cast<OffsetBufferAllocator>(allocator);
+    if (!offset_allocator) return std::nullopt;
+    auto buffer = offset_allocator->AllocateForRebuild(
+        descriptor.size_, reinterpret_cast<void*>(descriptor.buffer_address_),
+        descriptor.allocation_size_);
+    if (!buffer) return std::nullopt;
+    buffer->setAllocationEpoch(descriptor.allocation_epoch_);
+    Replica replica(std::move(buffer), ReplicaStatus::COMPLETE);
+    replica.id_ = desc.id;
+    auto next_id = Replica::next_id_.load();
+    while (next_id <= desc.id &&
+           !Replica::next_id_.compare_exchange_weak(next_id, desc.id + 1)) {
+    }
+    return replica;
 }
 
 auto MasterService::RebuildMetadata(const std::vector<KeyReplicaEntry>& entries,
@@ -988,53 +964,77 @@ auto MasterService::RebuildMetadata(const std::vector<KeyReplicaEntry>& entries,
     -> tl::expected<void, ErrorCode> {
     std::shared_lock<std::shared_mutex> snap_lock(snapshot_mutex_);
     for (const auto& e : entries) {
-        // (a) Descriptor -> holding Replica.
+        if (e.replicas.empty())
+            return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+        RebuildVersion incoming_version = e.version;
+        for (const auto& desc : e.replicas) {
+            if (!desc.is_memory_replica())
+                return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+            const auto& buffer = desc.get_memory_descriptor().buffer_descriptor;
+            if (buffer.size_ != e.size || buffer.allocation_size_ < e.size ||
+                e.size == 0 || desc.id == std::numeric_limits<ReplicaID>::max())
+                return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+            if (e.version == RebuildVersion{})
+                incoming_version =
+                    std::max(incoming_version,
+                             RebuildVersion{buffer.allocation_epoch_, desc.id});
+        }
+        const auto oid = MakeObjectIdentityForRequest(e.key, e.tenant_id);
+        MetadataAccessorRW accessor(this, oid);
+        if (accessor.Exists()) {
+            if (accessor.InProcessing())
+                return tl::make_unexpected(
+                    ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
+            auto current_version = accessor.Get().rebuild_version;
+            if (current_version == RebuildVersion{}) {
+                accessor.Get().VisitReplicas(
+                    &Replica::fn_is_memory_replica,
+                    [&](const Replica& replica) {
+                        const auto descriptor = replica.get_descriptor();
+                        current_version = std::max(
+                            current_version,
+                            RebuildVersion{
+                                descriptor.get_memory_descriptor()
+                                    .buffer_descriptor.allocation_epoch_,
+                                descriptor.id});
+                    });
+            }
+            if (incoming_version < current_version) continue;
+            if (incoming_version > current_version) {
+                accessor.Erase();
+            } else if (accessor.Get().size != e.size ||
+                       accessor.Get().group_id != e.group_id) {
+                return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+            }
+        }
         std::vector<Replica> replicas;
         replicas.reserve(e.replicas.size());
-        bool ok = true;
+        std::vector<Replica::Descriptor> missing;
         for (const auto& desc : e.replicas) {
+            if ((accessor.Exists() &&
+                 ReplicaAlreadyPresent(accessor.Get(), desc)) ||
+                std::any_of(missing.begin(), missing.end(),
+                            [&](const auto& prior) {
+                                return RebuildSameMemoryLocation(prior, desc);
+                            }))
+                continue;
             auto rep = DescriptorToReplica(desc);
             if (!rep) {
-                ok = false;
-                break;
+                return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
             }
+            missing.push_back(desc);
             replicas.emplace_back(std::move(*rep));
         }
-        if (!ok || replicas.empty()) {
-            LOG(ERROR) << "rebuild: failed to restore key=" << e.key
-                       << "; rejecting batch so the client retries";
-            return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
-        }
-
-        // (b) Insert or MERGE (multi-replica redundancy recovery).
-        const std::string tenant =
-            e.tenant_id.empty() ? "default" : e.tenant_id;
-        const ObjectIdentity oid{tenant, e.key};
-        MetadataAccessorRW accessor(this, oid);
         if (!accessor.Exists()) {
             accessor.Create(client_id, e.size, std::move(replicas),
                             /*enable_soft_pin=*/false,
                             /*enable_hard_pin=*/false, e.data_type, e.group_id);
         } else {
-            // Another owner already reported this key (replica_num>1): merge
-            // the incoming replica(s) instead of dropping them, de-duping by
-            // (endpoint,address).
-            auto& meta = accessor.Get();
-            for (auto& r : replicas) {
-                if (!ReplicaAlreadyPresent(meta, r)) {
-                    std::vector<Replica> one;
-                    one.emplace_back(std::move(r));
-                    meta.AddReplicas(std::move(one));
-                }
-            }
+            accessor.Get().AddReplicas(std::move(replicas));
         }
 
-        // (c) Mark available: GrantLease (mirrors PutEnd). Replicas rebuilt by
-        // DescriptorToReplica are already COMPLETE, so only mark_complete the
-        // ones still PROCESSING (avoids "already marked as complete" warnings).
         auto& meta = accessor.Get();
-        meta.VisitReplicas([](const Replica& r) { return !r.is_completed(); },
-                           [](Replica& r) { r.mark_complete(); });
+        meta.rebuild_version = incoming_version;
         meta.GrantLease(0, default_kv_soft_pin_ttl_);
         SyncCacheTotalAccounting(meta);
     }
@@ -3833,8 +3833,14 @@ auto MasterService::UpsertStart(const UUID& client_id, const std::string& key,
                     // data mid-transfer.  The key becomes unreadable until
                     // UpsertEnd.
                     metadata.VisitReplicas(
-                        &Replica::fn_is_completed,
-                        [](Replica& replica) { replica.mark_processing(); });
+                        &Replica::fn_is_completed, [this](Replica& replica) {
+                            replica.id_ = Replica::next_id_.fetch_add(1);
+                            if (replica.is_memory_replica())
+                                std::get<MemoryReplicaData>(replica.data_)
+                                    .buffer->setAllocationEpoch(view_version_);
+                            replica.mark_processing();
+                        });
+                    metadata.rebuild_version = {};
                     SyncCacheTotalAccounting(metadata);
 
                     tenant_state.processing_keys.insert(key);
@@ -8229,6 +8235,7 @@ MasterService::MetadataSerializer::DeserializeShard(const msgpack::object& obj,
 
         it->second.lease_timeout = metadata_ptr->lease_timeout;
         it->second.soft_pin_timeout = metadata_ptr->soft_pin_timeout;
+        it->second.rebuild_version = metadata_ptr->rebuild_version;
 
         // Recompute disk_object_count for restored metadata
         if (it->second.HasReplica([](const Replica& r) {
@@ -8254,6 +8261,7 @@ MasterService::MetadataSerializer::SerializeMetadata(
                              // has_soft_pin_timeout, soft_pin_timeout,
                              // replicas_count, data_type, hard_pinned, group_id
     array_size += metadata.CountReplicas();  // One element per replica
+    if (metadata.rebuild_version != RebuildVersion{}) ++array_size;
     packer.pack_array(array_size);
 
     // Serialize client_id
@@ -8306,6 +8314,11 @@ MasterService::MetadataSerializer::SerializeMetadata(
 
     packer.pack(metadata.IsHardPinned());
     packer.pack(metadata.group_id);
+    if (metadata.rebuild_version != RebuildVersion{}) {
+        packer.pack_array(2);
+        packer.pack(metadata.rebuild_version.first);
+        packer.pack(metadata.rebuild_version.second);
+    }
 
     return {};
 }
@@ -8363,7 +8376,7 @@ MasterService::MetadataSerializer::DeserializeMetadata(
     // replicas_count from wrapping the bounds and slipping an out-of-bounds
     // index past the size check.
     constexpr uint64_t kBaseFieldCount = 7;
-    constexpr uint64_t kMaxOptionalFieldCount = 3;
+    constexpr uint64_t kMaxOptionalFieldCount = 4;
     const uint64_t total_elements = obj.via.array.size;
     const uint64_t min_elements = kBaseFieldCount + replicas_count;
     if (total_elements < min_elements ||
@@ -8421,6 +8434,14 @@ MasterService::MetadataSerializer::DeserializeMetadata(
             std::chrono::milliseconds(put_start_time_timestamp)),
         size, std::move(replicas), enable_soft_pin, is_hard_pinned, data_type,
         group_id);
+    if (index < total_elements) {
+        const auto& version = array[index++];
+        if (version.type != msgpack::type::ARRAY || version.via.array.size != 2)
+            return tl::unexpected(SerializationError(
+                ErrorCode::DESERIALIZE_FAIL, "invalid rebuild version"));
+        metadata->rebuild_version = {version.via.array.ptr[0].as<int64_t>(),
+                                     version.via.array.ptr[1].as<uint64_t>()};
+    }
     metadata->lease_timeout = std::chrono::system_clock::time_point(
         std::chrono::milliseconds(lease_timestamp));
 

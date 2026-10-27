@@ -286,6 +286,8 @@ Client::Client(const std::string& local_hostname,
       pinned_buffer_pool_(std::make_unique<PinnedBufferPool>()),
       write_thread_pool_(2),
       task_thread_pool_(4) {
+    const char* rebuild = std::getenv("MC_ENABLE_HA_REBUILD");
+    enable_ha_rebuild_ = rebuild && std::string_view(rebuild) == "1";
     LOG(INFO) << "client_id=" << client_id_;
     if (!host_id_.empty()) {
         LOG(INFO) << "client_id=" << client_id_ << ", host_id=" << host_id_;
@@ -985,12 +987,11 @@ std::optional<std::shared_ptr<Client>> Client::Create(
         LOG(ERROR) << "Failed to initialize local hot cache";
     }
 
-    // === HA rebuild: start the notify-receiving loop now that transfer_engine_
-    // is ready. It polls getNotifies() and applies cross-client UPSERT entries
-    // into local_replica_table_. Stopped in ~Client.
-    client->rebuild_notify_thread_running_.store(true);
-    client->rebuild_notify_thread_ =
-        std::thread(&Client::RebuildNotifyLoop, client.get());
+    if (client->enable_ha_rebuild_) {
+        client->rebuild_notify_thread_running_.store(true);
+        client->rebuild_notify_thread_ =
+            std::thread(&Client::RebuildNotifyLoop, client.get());
+    }
 
     return client;
 }
@@ -1660,18 +1661,11 @@ tl::expected<void, ErrorCode> Client::Put(const ObjectKey& key,
         std::string group_id;
         if (config.group_ids && !config.group_ids->empty())
             group_id = config.group_ids->front();
-        for (const auto& replica : start_result.value()) {
-            if (!replica.is_memory_replica()) continue;
-            const std::string& ep = replica.get_memory_descriptor()
-                                        .buffer_descriptor.transport_endpoint_;
-            if (IsMyEndpoint(ep)) {
-                RecordLocalReplica(key, replica, value_size, config.data_type,
-                                   group_id, tenant_id);
-            } else {
-                NotifyOwnerUpsert(ep, key, replica, value_size,
-                                  config.data_type, group_id, tenant_id);
-            }
-        }
+        RecordCommittedReplicas(
+            key, start_result.value(), value_size, config.data_type, group_id,
+            tenant_id,
+            finalize_decision.end_type == ReplicaType::MEMORY ||
+                finalize_decision.end_type == ReplicaType::ALL);
     }
 
     return {};
@@ -1681,38 +1675,43 @@ tl::expected<void, ErrorCode> Client::Put(const ObjectKey& key,
 // HA rebuild: client-side local replica table helpers
 // ===========================================================================
 
-void Client::EraseByAddressLocked(uint64_t addr) {
-    // Caller must hold local_replica_table_mutex_.
-    auto it = addr_index_.find(addr);
-    if (it != addr_index_.end()) {
-        local_replica_table_.erase(it->second);
-        addr_index_.erase(it);
+void Client::RecordCommittedReplicas(
+    const std::string& key, const std::vector<Replica::Descriptor>& replicas,
+    uint64_t size, ObjectDataType data_type, const std::string& group_id,
+    const std::string& tenant_id, bool memory_committed) {
+    if (!enable_ha_rebuild_ || !memory_committed) return;
+    KeyReplicaEntry entry;
+    entry.key = key;
+    entry.tenant_id = tenant_id;
+    entry.size = size;
+    entry.data_type = data_type;
+    entry.group_id = group_id;
+    for (const auto& replica : replicas) {
+        if (!replica.is_memory_replica()) continue;
+        const auto& buffer = replica.get_memory_descriptor().buffer_descriptor;
+        entry.version =
+            std::max(entry.version,
+                     RebuildVersion{buffer.allocation_epoch_, replica.id});
     }
-}
-
-void Client::RecordLocalReplica(const std::string& key,
-                                const Replica::Descriptor& replica,
-                                uint64_t size, ObjectDataType data_type,
-                                const std::string& group_id,
-                                const std::string& tenant_id) {
-    if (!replica.is_memory_replica()) return;  // only memory replicas tracked
-    const uint64_t addr =
-        replica.get_memory_descriptor().buffer_descriptor.buffer_address_;
-    std::lock_guard<std::mutex> lk(local_replica_table_mutex_);
-    // Reuse-overwrite: evict whatever stale key currently occupies this
-    // address.
-    EraseByAddressLocked(addr);
-    // If the same key previously sat at a different address, drop that stale
-    // reverse-index entry too (rare: same key relocated).
-    auto old = local_replica_table_.find(key);
-    if (old != local_replica_table_.end()) {
-        const uint64_t old_addr = old->second.replica.get_memory_descriptor()
-                                      .buffer_descriptor.buffer_address_;
-        if (old_addr != addr) addr_index_.erase(old_addr);
+    std::unordered_map<std::string, std::vector<Replica::Descriptor>>
+        by_endpoint;
+    for (const auto& replica : replicas) {
+        if (!replica.is_memory_replica()) continue;
+        const auto& endpoint = replica.get_memory_descriptor()
+                                   .buffer_descriptor.transport_endpoint_;
+        if (IsMyEndpoint(endpoint)) {
+            std::lock_guard<std::mutex> lock(local_replica_table_mutex_);
+            local_replica_table_.Record(entry, replica);
+        } else {
+            by_endpoint[endpoint].push_back(replica);
+        }
     }
-    local_replica_table_[key] =
-        LocalReplicaMeta{replica, size, data_type, group_id, tenant_id};
-    addr_index_[addr] = key;
+    for (auto& [endpoint, owned_replicas] : by_endpoint) {
+        entry.replicas = std::move(owned_replicas);
+        const std::vector<KeyReplicaEntry> entries{entry};
+        if (!SendUpsertNotify(endpoint, entries))
+            ParkPendingNotify(endpoint, entries);
+    }
 }
 
 bool Client::IsMyEndpoint(const std::string& ep) {
@@ -1721,30 +1720,6 @@ bool Client::IsMyEndpoint(const std::string& ep) {
         if (seg.te_endpoint == ep) return true;
     }
     return false;
-}
-
-// --- notify send ------------------------------------------------------------
-// Tell the segment owner at `ep` "I stored `key` on your segment" with full
-// metadata, over the TE control-plane notify channel (not one-sided RDMA).
-void Client::NotifyOwnerUpsert(const std::string& ep, const std::string& key,
-                               const Replica::Descriptor& replica,
-                               uint64_t size, ObjectDataType data_type,
-                               const std::string& group_id,
-                               const std::string& tenant_id) {
-    KeyReplicaEntry e;
-    e.key = key;
-    e.tenant_id = tenant_id;
-    e.size = size;
-    e.data_type = data_type;
-    e.group_id = group_id;
-    e.replicas = {replica};
-    std::vector<KeyReplicaEntry> entries{std::move(e)};
-    // Reliability: if the send fails (peer flapping / not yet up), park it for
-    // the background loop to retry, so a dropped notify never silently loses a
-    // replica.
-    if (!SendUpsertNotify(ep, entries)) {
-        ParkPendingNotify(ep, entries);
-    }
 }
 
 // Build + base64 + send one UPSERT notify. Returns true iff the peer accepted.
@@ -1794,20 +1769,7 @@ void Client::FlushPendingNotifies() {
     }
 }
 
-void Client::NotifyOwnerUpsertBatch(
-    const std::unordered_map<std::string, std::vector<KeyReplicaEntry>>&
-        by_ep) {
-    for (const auto& [ep, entries] : by_ep) {
-        // Same reliability backstop as the singular path: park on failure.
-        if (!SendUpsertNotify(ep, entries)) {
-            ParkPendingNotify(ep, entries);
-        }
-    }
-}
-
 // --- notify receive loop -----------------------------------------------------
-// Poll getNotifies(), decode UPSERT entries, apply via RecordLocalReplica
-// (which does the address-overwrite that lazy-delete correctness depends on).
 void Client::RebuildNotifyLoop() {
     while (rebuild_notify_thread_running_.load()) {
         // Reliability backstop: retry any notifies whose send previously
@@ -1823,11 +1785,20 @@ void Client::RebuildNotifyLoop() {
                 RebuildNotify n;
                 auto ec =
                     struct_pack::deserialize_to(n, bin.data(), bin.size());
-                if (ec != struct_pack::errc::ok) continue;
+                if (ec != struct_pack::errc::ok ||
+                    n.op != RebuildNotifyOp::UPSERT)
+                    continue;
                 for (auto& e : n.entries) {
-                    if (e.replicas.empty()) continue;
-                    RecordLocalReplica(e.key, e.replicas.front(), e.size,
-                                       e.data_type, e.group_id, e.tenant_id);
+                    for (const auto& replica : e.replicas) {
+                        if (!replica.is_memory_replica() ||
+                            !IsMyEndpoint(
+                                replica.get_memory_descriptor()
+                                    .buffer_descriptor.transport_endpoint_))
+                            continue;
+                        std::lock_guard<std::mutex> lock(
+                            local_replica_table_mutex_);
+                        local_replica_table_.Record(e, replica);
+                    }
                 }
             }
         }
@@ -1843,17 +1814,7 @@ tl::expected<void, ErrorCode> Client::ResendLocalReplicaTable(
     std::vector<KeyReplicaEntry> snapshot;
     {
         std::lock_guard<std::mutex> lk(local_replica_table_mutex_);
-        snapshot.reserve(local_replica_table_.size());
-        for (const auto& [key, metadata] : local_replica_table_) {
-            KeyReplicaEntry entry;
-            entry.key = key;
-            entry.tenant_id = metadata.tenant_id;
-            entry.size = metadata.size;
-            entry.data_type = metadata.data_type;
-            entry.group_id = metadata.group_id;
-            entry.replicas = {metadata.replica};
-            snapshot.emplace_back(std::move(entry));
-        }
+        snapshot = local_replica_table_.Snapshot();
     }
 
     constexpr size_t kBatchSize = 256;
@@ -1954,6 +1915,15 @@ tl::expected<void, ErrorCode> Client::Upsert(const ObjectKey& key,
         return tl::unexpected(err);
     }
 
+    uint64_t value_size = 0;
+    for (const auto length : slice_lengths) value_size += length;
+    const std::string group_id = config.group_ids && !config.group_ids->empty()
+                                     ? config.group_ids->front()
+                                     : "";
+    RecordCommittedReplicas(key, start_result.value(), value_size,
+                            config.data_type, group_id,
+                            master_client_.tenant_id());
+
     // Success-side invalidation: a concurrent read between the pre-upsert
     // RemoveHotKey() and UpsertEnd could have read the old value and submitted
     // an async hot-cache fill with a still-valid token. Invalidate again now
@@ -2048,6 +2018,16 @@ class PutOperation {
     std::optional<std::string> failure_context;
 
     // Helper methods for robust state management
+    void SetRebuildMetadata(const ReplicateConfig& config,
+                            const std::string& tenant_id, size_t index) {
+        meta_size = 0;
+        for (const auto& slice : slices) meta_size += slice.size;
+        meta_data_type = config.data_type;
+        meta_tenant_id = tenant_id;
+        if (config.group_ids && index < config.group_ids->size())
+            meta_group_id = config.group_ids->at(index);
+    }
+
     void SetSuccess() {
         state = PutOperationState::SUCCESS;
         result = {};
@@ -2171,16 +2151,7 @@ void Client::StartBatchPut(std::vector<PutOperation>& ops,
     // Process individual responses with robust error handling
     for (size_t i = 0; i < ops.size(); ++i) {
         ops[i].InitializeRequestedReplicas(config);
-        // === HA rebuild: fill per-key metadata for local-table accounting ===
-        {
-            uint64_t sz = 0;
-            for (const auto& s : ops[i].slices) sz += s.size;
-            ops[i].meta_size = sz;
-            ops[i].meta_data_type = config.data_type;
-            ops[i].meta_tenant_id = master_client_.tenant_id();
-            if (config.group_ids && i < config.group_ids->size())
-                ops[i].meta_group_id = config.group_ids->at(i);
-        }
+        ops[i].SetRebuildMetadata(config, master_client_.tenant_id(), i);
         if (!start_responses[i]) {
             ops[i].SetTerminalError(start_responses[i].error(),
                                     PutOperationState::MASTER_FAILED,
@@ -2250,6 +2221,7 @@ void Client::StartBatchUpsert(std::vector<PutOperation>& ops,
             ops[i].SetError(start_responses[i].error(),
                             "Master failed to start upsert operation");
         } else {
+            ops[i].SetRebuildMetadata(config, master_client_.tenant_id(), i);
             ops[i].replicas = start_responses[i].value();
             VLOG(1) << "Successfully started upsert for key " << ops[i].key
                     << " with " << ops[i].replicas.size() << " replicas";
@@ -2562,21 +2534,11 @@ void Client::FinalizeBatchPut(std::vector<PutOperation>& ops) {
         }
         if (should_succeed[i]) {
             op.SetSuccess();
-            // === HA rebuild: account by owner ===
-            for (const auto& replica : op.replicas) {
-                if (!replica.is_memory_replica()) continue;
-                const std::string& ep =
-                    replica.get_memory_descriptor()
-                        .buffer_descriptor.transport_endpoint_;
-                if (IsMyEndpoint(ep))
-                    RecordLocalReplica(op.key, replica, op.meta_size,
-                                       op.meta_data_type, op.meta_group_id,
-                                       op.meta_tenant_id);
-                else
-                    NotifyOwnerUpsert(ep, op.key, replica, op.meta_size,
-                                      op.meta_data_type, op.meta_group_id,
-                                      op.meta_tenant_id);
-            }
+            RecordCommittedReplicas(
+                op.key, op.replicas, op.meta_size, op.meta_data_type,
+                op.meta_group_id, op.meta_tenant_id,
+                op.transfer_summary.failed_memory_transfers == 0 &&
+                    op.transfer_summary.successful_memory_transfers > 0);
             continue;
         }
         op.SetTerminalError(terminal_errors[i],
@@ -2635,6 +2597,10 @@ void Client::FinalizeBatchUpsert(std::vector<PutOperation>& ops) {
                                          "BatchUpsertEnd failed");
                 } else {
                     ops[op_idx].SetSuccess();
+                    const auto& op = ops[op_idx];
+                    RecordCommittedReplicas(op.key, op.replicas, op.meta_size,
+                                            op.meta_data_type, op.meta_group_id,
+                                            op.meta_tenant_id);
                     finalized_keys.emplace_back(successful_keys[i]);
                     VLOG(1) << "Successfully completed upsert for key "
                             << successful_keys[i];
@@ -4036,9 +4002,11 @@ void Client::StorageHeartbeatThreadMain() {
             return {};
         };
         ops.resend_metadata = [&] {
+            if (!enable_ha_rebuild_) return tl::expected<void, ErrorCode>{};
             return ResendLocalReplicaTable(view_version);
         };
         ops.signal_complete = [&] {
+            if (!enable_ha_rebuild_) return tl::expected<void, ErrorCode>{};
             return master_client_.SignalRebuildComplete(view_version);
         };
         auto result = RunRebuildRecovery(ops, kMaxAttempts, wait_before_retry);

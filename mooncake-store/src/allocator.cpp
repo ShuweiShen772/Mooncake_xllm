@@ -43,7 +43,11 @@ AllocatedBuffer::Descriptor AllocatedBuffer::get_descriptor() const {
     }
 
     return {static_cast<uint64_t>(size()),
-            reinterpret_cast<uintptr_t>(buffer_ptr_), this->protocol, endpoint};
+            reinterpret_cast<uintptr_t>(buffer_ptr_),
+            this->protocol,
+            endpoint,
+            allocation_epoch_,
+            offset_handle_ ? offset_handle_->extent() : size_};
 }
 
 void AllocatedBuffer::change_to_cxl(std::string client_segment_name) {
@@ -257,7 +261,8 @@ std::unique_ptr<AllocatedBuffer> OffsetBufferAllocator::allocate(size_t size) {
         // Create a custom AllocatedBuffer that manages the
         // OffsetAllocationHandle
         allocated_buffer = std::make_unique<AllocatedBuffer>(
-            shared_from_this(), buffer_ptr, size, std::move(allocation_handle));
+            shared_from_this(), buffer_ptr, size, std::move(allocation_handle),
+            allocation_epoch_);
         VLOG(1) << "allocation_succeeded size=" << size
                 << " segment=" << segment_name_ << " address=" << buffer_ptr;
     } catch (const std::exception& e) {
@@ -280,27 +285,21 @@ std::unique_ptr<AllocatedBuffer> OffsetBufferAllocator::allocate(size_t size) {
 }
 
 std::unique_ptr<AllocatedBuffer> OffsetBufferAllocator::AllocateForRebuild(
-    size_t size, void* real_addr) {
+    size_t size, void* real_addr, size_t extent) {
     if (!offset_allocator_) {
         LOG(ERROR) << "allocator_status=not_initialized";
         return nullptr;
     }
     std::unique_ptr<AllocatedBuffer> allocated_buffer = nullptr;
     try {
-        // Allocate to obtain a legit ownership handle (correct accounting +
-        // safe RAII deallocation). We DISCARD the allocator's self-chosen
-        // address and instead point the buffer at `real_addr` (the client's
-        // actual address).
-        auto allocation_handle = offset_allocator_->allocate(size);
+        auto allocation_handle = offset_allocator_->reserve(
+            reinterpret_cast<uintptr_t>(real_addr), size, extent);
         if (!allocation_handle) {
             VLOG(1) << "rebuild_allocation_failed size=" << size
                     << " segment=" << segment_name_
                     << " current_size=" << cur_size_;
             return nullptr;
         }
-        // Data address = client's real address; ownership handle = the legit
-        // one just allocated. deallocate() only touches the handle + size,
-        // never the data address, so this is safe.
         allocated_buffer = std::make_unique<AllocatedBuffer>(
             shared_from_this(), real_addr, size, std::move(allocation_handle));
         VLOG(1) << "rebuild_allocation_succeeded size=" << size

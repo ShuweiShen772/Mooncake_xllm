@@ -939,6 +939,7 @@ class MasterService {
         const std::string group_id;
         const std::string tenant_id;
         const std::string user_key;
+        RebuildVersion rebuild_version{};
 
         mutable SpinLock lock;
         // Default constructor, creates a time_point representing
@@ -1427,7 +1428,7 @@ class MasterService {
     // in meta? Declared here (after ObjectMetadata is defined) because it takes
     // const ObjectMetadata&.
     bool ReplicaAlreadyPresent(const ObjectMetadata& meta,
-                               const Replica& r) const;
+                               const Replica::Descriptor& descriptor) const;
 
     static std::string MakeTenantScopedKey(const std::string& tenant_id,
                                            const std::string& key) {
