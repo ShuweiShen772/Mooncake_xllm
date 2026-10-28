@@ -58,6 +58,73 @@ TEST(MasterRebuildReplayTest, NewerWriteSupersedesOtherOwnersStaleSnapshot) {
     EXPECT_EQ(descriptor.buffer_address_, 4352);
 }
 
+TEST(MasterRebuildReplayTest, RecreatedObjectsChangeGroupsInEitherReplayOrder) {
+    for (const bool newest_first : {false, true}) {
+        for (const std::string incoming_group : {"new-group", ""}) {
+            SCOPED_TRACE(incoming_group +
+                         (newest_first ? " newest" : " oldest"));
+            const auto config = MasterServiceConfig::builder()
+                                    .set_default_kv_lease_ttl(60000)
+                                    .set_view_version(43)
+                                    .build();
+            MasterService recovered(config);
+            const UUID owner = generate_uuid();
+            Segment segment;
+            segment.id = generate_uuid();
+            segment.name = "group-owner";
+            segment.te_endpoint = segment.name;
+            segment.base = 4096;
+            segment.size = 4096;
+            ASSERT_TRUE(recovered.ReMountSegment({segment}, owner));
+            KeyReplicaEntry old_entry;
+            old_entry.key = "recreated-key";
+            old_entry.group_id = "old-group";
+            old_entry.size = 128;
+            old_entry.version = {42, 1};
+            Replica::Descriptor replica;
+            replica.id = 1;
+            replica.status = ReplicaStatus::COMPLETE;
+            MemoryDescriptor memory;
+            memory.buffer_descriptor = {128, 4096, "tcp", segment.te_endpoint,
+                                        42,  128};
+            replica.descriptor_variant = memory;
+            old_entry.replicas = {replica};
+            auto latest = old_entry;
+            latest.group_id = incoming_group;
+            latest.version = {42, 2};
+            latest.replicas.front().id = 2;
+            std::get<MemoryDescriptor>(
+                latest.replicas.front().descriptor_variant)
+                .buffer_descriptor.buffer_address_ = 4352;
+            auto unrelated = old_entry;
+            unrelated.key = "unrelated-key";
+            unrelated.group_id.clear();
+            unrelated.replicas.front().id = 3;
+            std::get<MemoryDescriptor>(
+                unrelated.replicas.front().descriptor_variant)
+                .buffer_descriptor.buffer_address_ = 4608;
+            ASSERT_TRUE(recovered.RebuildMetadata(
+                {newest_first ? latest : old_entry}, owner));
+            ASSERT_TRUE(recovered.RebuildMetadata(
+                {newest_first ? old_entry : latest, unrelated}, owner));
+            ASSERT_TRUE(recovered.RebuildMetadata({old_entry, latest}, owner));
+            const auto committed =
+                recovered.GetCommittedRebuildEntry(latest.key, "default");
+            ASSERT_TRUE(committed);
+            EXPECT_EQ(committed->group_id, incoming_group);
+            EXPECT_EQ(committed->version, latest.version);
+            ASSERT_EQ(committed->replicas.size(), 1);
+            EXPECT_EQ(committed->replicas.front()
+                          .get_memory_descriptor()
+                          .buffer_descriptor.buffer_address_,
+                      4352);
+            EXPECT_TRUE(recovered.GetReplicaList(unrelated.key, "default"));
+            ASSERT_TRUE(recovered.Remove(latest.key, "default", true));
+            EXPECT_FALSE(recovered.GetReplicaList(latest.key, "default"));
+        }
+    }
+}
+
 TEST(MasterRebuildReplayTest, FullSegmentSurvivesLostCompletionAndLaterWrites) {
     std::vector<unsigned char> bytes(4096);
     const UUID client_id = generate_uuid();

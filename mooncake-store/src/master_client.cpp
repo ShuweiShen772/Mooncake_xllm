@@ -168,6 +168,11 @@ struct RpcNameTraits<&WrappedMasterService::GetCommittedRebuildEntry> {
 };
 
 template <>
+struct RpcNameTraits<&WrappedMasterService::BatchGetCommittedRebuildEntries> {
+    static constexpr const char* value = "BatchGetCommittedRebuildEntries";
+};
+
+template <>
 struct RpcNameTraits<&WrappedMasterService::SignalRebuildCompleteRpc> {
     static constexpr const char* value = "SignalRebuildCompleteRpc";
 };
@@ -833,6 +838,14 @@ tl::expected<KeyReplicaEntry, ErrorCode> MasterClient::GetCommittedRebuildEntry(
     const std::string& key, const std::string& tenant_id) {
     return invoke_rpc<&WrappedMasterService::GetCommittedRebuildEntry,
                       KeyReplicaEntry>(key, tenant_id);
+}
+
+std::vector<tl::expected<KeyReplicaEntry, ErrorCode>>
+MasterClient::BatchGetCommittedRebuildEntries(
+    const std::vector<std::string>& keys, const std::string& tenant_id) {
+    return invoke_batch_rpc<
+        &WrappedMasterService::BatchGetCommittedRebuildEntries,
+        KeyReplicaEntry>(keys.size(), keys, tenant_id);
 }
 
 tl::expected<void, ErrorCode> MasterClient::RebuildMetadata(

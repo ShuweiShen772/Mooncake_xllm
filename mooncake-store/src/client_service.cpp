@@ -1670,32 +1670,69 @@ tl::expected<void, ErrorCode> Client::RecordCommittedReplicas(
     const std::string& key, const std::string& tenant_id,
     bool memory_committed) {
     if (!enable_ha_rebuild_ || !memory_committed) return {};
-    auto committed = master_client_.GetCommittedRebuildEntry(key, tenant_id);
-    if (!committed) return tl::make_unexpected(committed.error());
-    auto entry = std::move(*committed);
-    std::unordered_map<std::string, std::vector<Replica::Descriptor>>
-        by_endpoint;
-    for (const auto& replica : entry.replicas) {
-        if (!replica.is_memory_replica()) continue;
-        const auto& endpoint = replica.get_memory_descriptor()
-                                   .buffer_descriptor.transport_endpoint_;
-        by_endpoint[endpoint].push_back(replica);
+    return BatchRecordCommittedReplicas({key}, tenant_id).front();
+}
+
+std::vector<tl::expected<void, ErrorCode>> Client::BatchRecordCommittedReplicas(
+    const std::vector<std::string>& keys, const std::string& tenant_id) {
+    std::vector<tl::expected<void, ErrorCode>> results(keys.size());
+    if (!enable_ha_rebuild_ || keys.empty()) return results;
+    auto committed =
+        master_client_.BatchGetCommittedRebuildEntries(keys, tenant_id);
+    if (committed.size() != keys.size())
+        return {keys.size(), tl::make_unexpected(ErrorCode::RPC_FAIL)};
+    struct OwnerBatch {
+        std::vector<KeyReplicaEntry> entries;
+        std::vector<size_t> indices;
+    };
+    std::unordered_map<std::string, OwnerBatch> by_endpoint;
+    for (size_t index = 0; index < committed.size(); ++index) {
+        if (!committed[index]) {
+            results[index] = tl::make_unexpected(committed[index].error());
+            continue;
+        }
+        auto& entry = *committed[index];
+        std::unordered_map<std::string, std::vector<Replica::Descriptor>> owned;
+        for (const auto& replica : entry.replicas) {
+            if (!replica.is_memory_replica()) continue;
+            const auto& endpoint = replica.get_memory_descriptor()
+                                       .buffer_descriptor.transport_endpoint_;
+            owned[endpoint].push_back(replica);
+        }
+        for (auto& [endpoint, replicas] : owned) {
+            entry.replicas = std::move(replicas);
+            auto& batch = by_endpoint[endpoint];
+            batch.entries.push_back(entry);
+            batch.indices.push_back(index);
+        }
     }
     std::vector<uint64_t> request_ids;
     request_ids.reserve(by_endpoint.size());
-    for (auto& [endpoint, owned_replicas] : by_endpoint) {
-        entry.replicas = std::move(owned_replicas);
-        const std::vector<KeyReplicaEntry> entries{entry};
+    std::unordered_map<uint64_t, std::vector<size_t>> request_indices;
+    for (auto& [endpoint, batch] : by_endpoint) {
         if (IsMyEndpoint(endpoint)) {
-            auto result = ApplyOwnedRebuildEntries(entries);
-            if (!result) return result;
+            auto result = ApplyOwnedRebuildEntries(batch.entries);
+            if (!result)
+                for (const auto index : batch.indices)
+                    results[index] = tl::make_unexpected(result.error());
         } else {
-            request_ids.emplace_back(ParkPendingNotify(endpoint, entries));
+            const uint64_t request_id =
+                ParkPendingNotify(endpoint, batch.entries);
+            request_ids.emplace_back(request_id);
+            request_indices.emplace(request_id, std::move(batch.indices));
         }
     }
-    if (!request_ids.empty() && !WaitForPendingNotifies(request_ids))
-        return tl::make_unexpected(ErrorCode::RPC_TIMEOUT);
-    return {};
+    if (!request_ids.empty() && !WaitForPendingNotifies(request_ids)) {
+        std::lock_guard<std::mutex> lock(pending_notifies_mutex_);
+        for (const auto& [request_id, indices] : request_indices) {
+            if (!pending_notifies_.contains(request_id)) continue;
+            for (const auto index : indices)
+                if (results[index])
+                    results[index] =
+                        tl::make_unexpected(ErrorCode::RPC_TIMEOUT);
+        }
+    }
+    return results;
 }
 
 bool Client::IsMyEndpoint(const std::string& ep) {
@@ -1754,13 +1791,16 @@ void Client::FlushPendingNotifies() {
 
 bool Client::WaitForPendingNotifies(const std::vector<uint64_t>& request_ids) {
     std::unique_lock<std::mutex> lock(pending_notifies_mutex_);
-    return pending_notifies_cv_.wait_for(lock, std::chrono::seconds(30), [&] {
-        if (request_ids.empty()) return pending_notifies_.empty();
-        return std::none_of(request_ids.begin(), request_ids.end(),
-                            [&](uint64_t request_id) {
-                                return pending_notifies_.contains(request_id);
-                            });
-    });
+    return pending_notifies_cv_.wait_for(
+        lock, std::chrono::milliseconds(rebuild_notify_timeout_ms_.load()),
+        [&] {
+            if (request_ids.empty()) return pending_notifies_.empty();
+            return std::none_of(
+                request_ids.begin(), request_ids.end(),
+                [&](uint64_t request_id) {
+                    return pending_notifies_.contains(request_id);
+                });
+        });
 }
 
 tl::expected<void, ErrorCode> Client::ApplyOwnedRebuildEntries(
@@ -1944,15 +1984,13 @@ tl::expected<void, ErrorCode> Client::Upsert(const ObjectKey& key,
     }
 
     // End upsert operation
+    if (before_upsert_end_for_test_) before_upsert_end_for_test_();
     auto end_result = master_client_.UpsertEnd(key, ReplicaType::MEMORY);
     if (!end_result) {
         ErrorCode err = end_result.error();
         LOG(ERROR) << "Failed to end upsert operation: " << err;
         return tl::unexpected(err);
     }
-
-    auto recorded = RecordCommittedReplicas(key, master_client_.tenant_id());
-    if (!recorded) return recorded;
 
     // Success-side invalidation: a concurrent read between the pre-upsert
     // RemoveHotKey() and UpsertEnd could have read the old value and submitted
@@ -1962,7 +2000,7 @@ tl::expected<void, ErrorCode> Client::Upsert(const ObjectKey& key,
         hot_cache_->RemoveHotKey(key);
     }
 
-    return {};
+    return RecordCommittedReplicas(key, master_client_.tenant_id());
 }
 
 std::vector<tl::expected<void, ErrorCode>> Client::BatchUpsert(
@@ -2544,14 +2582,6 @@ void Client::FinalizeBatchPut(std::vector<PutOperation>& ops) {
         }
         if (should_succeed[i]) {
             op.SetSuccess();
-            auto recorded = RecordCommittedReplicas(
-                op.key, master_client_.tenant_id(),
-                op.transfer_summary.failed_memory_transfers == 0 &&
-                    op.transfer_summary.successful_memory_transfers > 0);
-            if (!recorded)
-                op.SetTerminalError(recorded.error(),
-                                    PutOperationState::FINALIZE_FAILED,
-                                    "Ownership acknowledgement failed");
             continue;
         }
         op.SetTerminalError(terminal_errors[i],
@@ -2590,6 +2620,7 @@ void Client::FinalizeBatchUpsert(std::vector<PutOperation>& ops) {
     std::vector<std::string> finalized_keys;
     if (!successful_keys.empty()) {
         finalized_keys.reserve(successful_keys.size());
+        if (before_upsert_end_for_test_) before_upsert_end_for_test_();
         auto end_responses = master_client_.BatchUpsertEnd(successful_keys);
         if (end_responses.size() != successful_keys.size()) {
             LOG(ERROR) << "BatchUpsertEnd response size mismatch: expected "
@@ -2610,14 +2641,6 @@ void Client::FinalizeBatchUpsert(std::vector<PutOperation>& ops) {
                                          "BatchUpsertEnd failed");
                 } else {
                     ops[op_idx].SetSuccess();
-                    const auto& op = ops[op_idx];
-                    auto recorded = RecordCommittedReplicas(
-                        op.key, master_client_.tenant_id());
-                    if (!recorded)
-                        ops[op_idx].SetTerminalError(
-                            recorded.error(),
-                            PutOperationState::FINALIZE_FAILED,
-                            "Ownership acknowledgement failed");
                     finalized_keys.emplace_back(successful_keys[i]);
                     VLOG(1) << "Successfully completed upsert for key "
                             << successful_keys[i];
@@ -2680,6 +2703,12 @@ std::vector<tl::expected<void, ErrorCode>> Client::CollectResults(
     const std::vector<PutOperation>& ops) {
     std::vector<tl::expected<void, ErrorCode>> results;
     results.reserve(ops.size());
+    std::vector<std::string> committed_keys;
+    std::vector<size_t> committed_indices;
+    if (enable_ha_rebuild_) {
+        committed_keys.reserve(ops.size());
+        committed_indices.reserve(ops.size());
+    }
 
     int no_available_handle_count = 0;
     for (const auto& op : ops) {
@@ -2692,8 +2721,11 @@ std::vector<tl::expected<void, ErrorCode>> Client::CollectResults(
             // UpsertStart never returns this error, so this branch is
             // unreachable for BatchUpsert — kept for BatchPut compatibility.
             if (op.result.error() == ErrorCode::OBJECT_ALREADY_EXISTS) {
-                results.back() =
-                    RecordCommittedReplicas(op.key, master_client_.tenant_id());
+                results.back() = {};
+                if (enable_ha_rebuild_) {
+                    committed_keys.push_back(op.key);
+                    committed_indices.push_back(results.size() - 1);
+                }
                 continue;
             }
             if (op.result.error() == ErrorCode::NO_AVAILABLE_HANDLE) {
@@ -2706,6 +2738,12 @@ std::vector<tl::expected<void, ErrorCode>> Client::CollectResults(
                                    : "");
             }
         } else {
+            if (enable_ha_rebuild_ &&
+                op.transfer_summary.failed_memory_transfers == 0 &&
+                op.transfer_summary.successful_memory_transfers > 0) {
+                committed_keys.push_back(op.key);
+                committed_indices.push_back(results.size() - 1);
+            }
             VLOG(1) << "Operation for key " << op.key
                     << " completed successfully";
         }
@@ -2715,6 +2753,12 @@ std::vector<tl::expected<void, ErrorCode>> Client::CollectResults(
                      << " keys" << PUT_NO_SPACE_HELPER_STR;
     }
 
+    if (!committed_keys.empty()) {
+        auto recorded = BatchRecordCommittedReplicas(
+            committed_keys, master_client_.tenant_id());
+        for (size_t index = 0; index < recorded.size(); ++index)
+            results[committed_indices[index]] = std::move(recorded[index]);
+    }
     return results;
 }
 
@@ -3532,11 +3576,6 @@ tl::expected<void, ErrorCode> Client::Copy(
 tl::expected<void, ErrorCode> Client::Move(const std::string& key,
                                            const std::string& source,
                                            const std::string& target) {
-    if (enable_ha_rebuild_) {
-        LOG(WARNING)
-            << "Move is unavailable while MC_ENABLE_HA_REBUILD is enabled";
-        return tl::make_unexpected(ErrorCode::UNAVAILABLE_IN_CURRENT_MODE);
-    }
     return Move(key, master_client_.tenant_id(), source, target);
 }
 
@@ -3544,6 +3583,11 @@ tl::expected<void, ErrorCode> Client::Move(const std::string& key,
                                            const std::string& tenant_id,
                                            const std::string& source,
                                            const std::string& target) {
+    if (enable_ha_rebuild_) {
+        LOG(WARNING)
+            << "Move is unavailable while MC_ENABLE_HA_REBUILD is enabled";
+        return tl::make_unexpected(ErrorCode::UNAVAILABLE_IN_CURRENT_MODE);
+    }
     LOG(INFO) << "action=replica_move_start" << ", key=" << key
               << ", source_segment=" << source << ", target_segment=" << target;
 

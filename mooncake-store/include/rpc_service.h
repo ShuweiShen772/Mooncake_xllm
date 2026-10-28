@@ -177,6 +177,10 @@ class WrappedMasterService {
     tl::expected<KeyReplicaEntry, ErrorCode> GetCommittedRebuildEntry(
         const std::string& key, const std::string& tenant_id);
 
+    std::vector<tl::expected<KeyReplicaEntry, ErrorCode>>
+    BatchGetCommittedRebuildEntries(const std::vector<std::string>& keys,
+                                    const std::string& tenant_id);
+
     tl::expected<void, ErrorCode> ReMountNoFSegment(
         const std::vector<NoFSegment>& segments, const UUID& client_id);
 

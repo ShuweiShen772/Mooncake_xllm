@@ -18,6 +18,11 @@ segments. Restart clients after changing it. Enabling only the master gate can
 leave recovery waiting for disabled clients until the degraded-service timeout.
 Non-HA restart tests enable the client setting while leaving the master gate off.
 
+`/health` reports `service_ready=false` while the data RPC rebuild gate is
+closed, and `true` once it opens, including degraded service after timeout.
+Leader discovery and rebuild RPCs remain available during this interval;
+the leader role or label identifies the elected leader rather than data readiness.
+
 Recovery currently imports memory replicas managed by the offset allocator.
 Descriptors carry the original allocation extent and a master-issued ordering
 token derived from the HA view and replica IDs. All replicas reported for one
@@ -31,6 +36,11 @@ returns an error if acknowledgements do not arrive within 30 seconds. Owners
 replay notifications arriving after their recovery snapshot into the current
 master view before acknowledging them. Recovery completion also waits for the
 client's pending acknowledgements.
+
+Batch writes fetch committed records in one RPC, group ownership notifications
+by destination owner, and share one 30-second acknowledgement deadline for the
+batch. Errors are returned for the affected keys. Upsert invalidates the local
+hot cache immediately after commit, even if ownership acknowledgement fails.
 
 Ownership records obtain the committed size, group, data type and pin settings
 from the master, including the attributes preserved by Upsert. Rebuild restores

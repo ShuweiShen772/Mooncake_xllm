@@ -148,6 +148,8 @@ TEST(HaRebuildGateTest, RebuildingRejectsBusinessAndAllowsRecoveryRpc) {
     ExpectUnavailable(service.GetReplicaListByRegex(".*"));
     ExpectUnavailable(service.GetReplicaList("key"));
     ExpectUnavailable(service.BatchGetReplicaList({"key"}));
+    ExpectUnavailable(
+        service.BatchGetCommittedRebuildEntries({"key", "other"}, "default"));
     ExpectUnavailable(service.PutStart(client, "key", 8, config));
     ExpectUnavailable(service.PutEnd(client, "key"));
     ExpectUnavailable(service.PutRevoke(client, "key"));

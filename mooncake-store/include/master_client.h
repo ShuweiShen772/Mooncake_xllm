@@ -360,6 +360,10 @@ class MasterClient {
     GetCommittedRebuildEntry(const std::string& key,
                              const std::string& tenant_id);
 
+    [[nodiscard]] std::vector<tl::expected<KeyReplicaEntry, ErrorCode>>
+    BatchGetCommittedRebuildEntries(const std::vector<std::string>& keys,
+                                    const std::string& tenant_id);
+
     /**
      * @brief Tell the new empty master that this client has resent all
      * metadata. The master starts serving after every expected client reports

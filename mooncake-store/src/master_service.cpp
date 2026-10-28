@@ -982,21 +982,14 @@ auto MasterService::RebuildMetadata(const std::vector<KeyReplicaEntry>& entries,
                     std::max(incoming_version,
                              RebuildVersion{buffer.allocation_epoch_, desc.id});
         }
-        const auto route = GetGroupRoute(oid.tenant_id, oid.user_key);
-        if (route && *route != e.group_id)
-            return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
-        const size_t shard_index =
-            e.group_id.empty()
-                ? getMetadataShardIndex(oid.tenant_id, oid.user_key)
-                : getShardIndex(e.group_id);
-        MetadataAccessorRW accessor(this, oid, shard_index);
-        if (accessor.Exists()) {
-            if (accessor.InProcessing())
+        auto accessor = std::make_unique<MetadataAccessorRW>(this, oid);
+        if (accessor->Exists()) {
+            if (accessor->InProcessing())
                 return tl::make_unexpected(
                     ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
-            auto current_version = accessor.Get().rebuild_version;
+            auto current_version = accessor->Get().rebuild_version;
             if (current_version == RebuildVersion{}) {
-                accessor.Get().VisitReplicas(
+                accessor->Get().VisitReplicas(
                     &Replica::fn_is_memory_replica,
                     [&](const Replica& replica) {
                         const auto descriptor = replica.get_descriptor();
@@ -1010,9 +1003,9 @@ auto MasterService::RebuildMetadata(const std::vector<KeyReplicaEntry>& entries,
             }
             if (incoming_version < current_version) continue;
             if (incoming_version > current_version) {
-                accessor.Erase();
+                accessor->Erase();
             } else {
-                const auto& metadata = accessor.Get();
+                const auto& metadata = accessor->Get();
                 SpinLocker pin_lock(&metadata.lock);
                 if (metadata.size != e.size ||
                     metadata.group_id != e.group_id ||
@@ -1021,12 +1014,20 @@ auto MasterService::RebuildMetadata(const std::vector<KeyReplicaEntry>& entries,
                     return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
             }
         }
+        if (!accessor->Exists()) {
+            accessor.reset();
+            const size_t shard_index =
+                e.group_id.empty() ? getShardIndex(oid.tenant_id, oid.user_key)
+                                   : getShardIndex(e.group_id);
+            accessor =
+                std::make_unique<MetadataAccessorRW>(this, oid, shard_index);
+        }
         std::vector<Replica> replicas;
         replicas.reserve(e.replicas.size());
         std::vector<Replica::Descriptor> missing;
         for (const auto& desc : e.replicas) {
-            if ((accessor.Exists() &&
-                 ReplicaAlreadyPresent(accessor.Get(), desc)) ||
+            if ((accessor->Exists() &&
+                 ReplicaAlreadyPresent(accessor->Get(), desc)) ||
                 std::any_of(missing.begin(), missing.end(),
                             [&](const auto& prior) {
                                 return RebuildSameMemoryLocation(prior, desc);
@@ -1039,17 +1040,17 @@ auto MasterService::RebuildMetadata(const std::vector<KeyReplicaEntry>& entries,
             missing.push_back(desc);
             replicas.emplace_back(std::move(*rep));
         }
-        if (!accessor.Exists()) {
-            accessor.Create(client_id, e.size, std::move(replicas),
-                            e.with_soft_pin, e.with_hard_pin, e.data_type,
-                            e.group_id);
-            RegisterGroupMember(accessor.GetTenantState(), oid.tenant_id,
+        if (!accessor->Exists()) {
+            accessor->Create(client_id, e.size, std::move(replicas),
+                             e.with_soft_pin, e.with_hard_pin, e.data_type,
+                             e.group_id);
+            RegisterGroupMember(accessor->GetTenantState(), oid.tenant_id,
                                 oid.user_key, e.group_id);
         } else {
-            accessor.Get().AddReplicas(std::move(replicas));
+            accessor->Get().AddReplicas(std::move(replicas));
         }
 
-        auto& meta = accessor.Get();
+        auto& meta = accessor->Get();
         meta.rebuild_version = incoming_version;
         meta.GrantLease(0, default_kv_soft_pin_ttl_);
         if (enable_multi_tenants_) {

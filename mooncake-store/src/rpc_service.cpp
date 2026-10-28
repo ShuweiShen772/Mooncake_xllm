@@ -876,6 +876,20 @@ WrappedMasterService::GetCommittedRebuildEntry(const std::string& key,
     return master_service_.GetCommittedRebuildEntry(key, tenant_id);
 }
 
+std::vector<tl::expected<KeyReplicaEntry, ErrorCode>>
+WrappedMasterService::BatchGetCommittedRebuildEntries(
+    const std::vector<std::string>& keys, const std::string& tenant_id) {
+    if (!IsServing())
+        return {keys.size(),
+                tl::make_unexpected(ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS)};
+    std::vector<tl::expected<KeyReplicaEntry, ErrorCode>> results;
+    results.reserve(keys.size());
+    for (const auto& key : keys)
+        results.emplace_back(
+            master_service_.GetCommittedRebuildEntry(key, tenant_id));
+    return results;
+}
+
 tl::expected<void, ErrorCode> WrappedMasterService::RebuildMetadata(
     const std::vector<KeyReplicaEntry>& entries, const UUID& client_id,
     ViewVersionId view_version) {
@@ -1784,6 +1798,9 @@ void RegisterRpcService(
         &wrapped_master_service);
     server.register_handler<
         &mooncake::WrappedMasterService::GetCommittedRebuildEntry>(
+        &wrapped_master_service);
+    server.register_handler<
+        &mooncake::WrappedMasterService::BatchGetCommittedRebuildEntries>(
         &wrapped_master_service);
     server.register_handler<
         &mooncake::WrappedMasterService::SignalRebuildCompleteRpc>(

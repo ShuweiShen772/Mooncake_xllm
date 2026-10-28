@@ -44,6 +44,17 @@
 DEFINE_string(protocol, "tcp", "Transfer protocol: rdma|tcp");
 
 namespace mooncake {
+struct ClientTestAccess {
+    static auto Move(Client& client, const std::string& key,
+                     const std::string& source, const std::string& target) {
+        return client.Move(key, source, target);
+    }
+    static auto Move(Client& client, const std::string& key,
+                     const std::string& tenant_id, const std::string& source,
+                     const std::string& target) {
+        return client.Move(key, tenant_id, source, target);
+    }
+};
 namespace testing {
 
 namespace {
@@ -498,6 +509,250 @@ class ClientCrossNotifyTest : public ::testing::Test {
     void* segB_ = nullptr;
     std::unique_ptr<SimpleAllocator> allocA_, allocB_;
 };
+
+TEST_F(ClientCrossNotifyTest, BatchAckTimeoutOnlyFailsKeysOnStalledOwner) {
+    ASSERT_TRUE(PutString(clientA_, *allocA_, "remote-existing", "old-remote"));
+    void* local_segment = allocate_buffer_allocator_memory(kSeg);
+    ASSERT_NE(local_segment, nullptr);
+    ASSERT_TRUE(clientA_->MountSegment(local_segment, kSeg, FLAGS_protocol));
+    void* buffer = allocA_->allocate(128);
+    std::memset(buffer, 'L', 128);
+    std::vector<Slice> slices{Slice{buffer, 128}};
+    ReplicateConfig local;
+    local.preferred_segments = {"127.0.0.1:19202"};
+    ASSERT_TRUE(clientA_->Put("local-existing", slices, local));
+    clientA_->SetRebuildNotifyTimeoutForTest(std::chrono::milliseconds(300));
+    clientB_->PauseRebuildNotifiesForTest(true);
+    std::vector<std::vector<Slice>> values{slices, slices, slices};
+    ReplicateConfig remote;
+    remote.preferred_segments = {"127.0.0.1:19201"};
+    const auto results = clientA_->BatchPut(
+        {"remote-existing", "local-existing", "remote-new"}, values, remote);
+    ASSERT_EQ(results.size(), 3);
+    EXPECT_FALSE(results[0]);
+    if (!results[0]) {
+        EXPECT_EQ(results[0].error(), ErrorCode::RPC_TIMEOUT);
+    }
+    EXPECT_TRUE(results[1]);
+    EXPECT_FALSE(results[2]);
+    if (!results[2]) {
+        EXPECT_EQ(results[2].error(), ErrorCode::RPC_TIMEOUT);
+    }
+    EXPECT_EQ(clientA_->PendingNotifyEntryCountForTest(), 2);
+    EXPECT_EQ(clientA_->PendingNotifyBucketCountForTest(), 1);
+    clientB_->PauseRebuildNotifiesForTest(false);
+    for (int attempt = 0;
+         attempt < 100 && clientA_->PendingNotifyBucketCountForTest() != 0;
+         ++attempt)
+        std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    EXPECT_EQ(clientA_->PendingNotifyBucketCountForTest(), 0);
+    EXPECT_TRUE(
+        GetAndVerify(clientA_, *allocA_, "remote-existing", "old-remote"));
+    EXPECT_TRUE(GetAndVerify(clientA_, *allocA_, "local-existing",
+                             std::string(128, 'L')));
+    EXPECT_TRUE(
+        GetAndVerify(clientA_, *allocA_, "remote-new", std::string(128, 'L')));
+    allocA_->deallocate(buffer, 128);
+    EXPECT_TRUE(clientA_->UnmountSegment(local_segment, kSeg));
+}
+
+class ClientBatchNotifyTest : public ClientCrossNotifyTest,
+                              public ::testing::WithParamInterface<bool> {};
+
+TEST_P(ClientBatchNotifyTest, EnqueuesAllKeysBeforeWaitingForOwner) {
+    const bool upsert = GetParam();
+    std::vector<std::string> keys;
+    std::vector<std::vector<Slice>> values;
+    for (size_t index = 0; index < 16; ++index) {
+        keys.push_back("batch-notify-" + std::to_string(index));
+        void* buffer = allocA_->allocate(128);
+        std::memset(buffer, static_cast<int>(index), 128);
+        values.push_back({Slice{buffer, 128}});
+    }
+    clientA_->SetRebuildNotifyTimeoutForTest(std::chrono::seconds(3));
+    clientB_->PauseRebuildNotifiesForTest(true);
+    auto write = std::async(std::launch::async, [&] {
+        return upsert ? clientA_->BatchUpsert(keys, values, ReplicateConfig{})
+                      : clientA_->BatchPut(keys, values, ReplicateConfig{});
+    });
+    for (int attempt = 0;
+         attempt < 100 &&
+         clientA_->PendingNotifyEntryCountForTest() < keys.size();
+         ++attempt)
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    EXPECT_EQ(clientA_->PendingNotifyEntryCountForTest(), keys.size());
+    EXPECT_EQ(clientA_->PendingNotifyBucketCountForTest(), 1);
+    EXPECT_EQ(write.wait_for(std::chrono::milliseconds(0)),
+              std::future_status::timeout);
+    clientB_->PauseRebuildNotifiesForTest(false);
+    const auto results = write.get();
+    ASSERT_EQ(results.size(), keys.size());
+    for (size_t index = 0; index < keys.size(); ++index) {
+        EXPECT_TRUE(results[index]);
+        EXPECT_TRUE(GetAndVerify(clientA_, *allocA_, keys[index],
+                                 std::string(128, static_cast<char>(index))));
+        allocA_->deallocate(values[index].front().ptr, 128);
+    }
+    EXPECT_EQ(clientA_->PendingNotifyBucketCountForTest(), 0);
+    EXPECT_EQ(clientB_->LocalReplicaSnapshotForTest().size(), keys.size());
+}
+
+TEST_P(ClientBatchNotifyTest, StalledOwnerUsesOneDeadlineForWholeBatch) {
+    const bool upsert = GetParam();
+    std::vector<std::string> keys;
+    std::vector<std::vector<Slice>> values;
+    void* buffer = allocA_->allocate(128);
+    std::memset(buffer, 'V', 128);
+    for (size_t index = 0; index < 16; ++index) {
+        keys.push_back("timeout-notify-" + std::to_string(index));
+        values.push_back({Slice{buffer, 128}});
+    }
+    clientA_->SetRebuildNotifyTimeoutForTest(std::chrono::milliseconds(300));
+    clientB_->PauseRebuildNotifiesForTest(true);
+    const auto start = std::chrono::steady_clock::now();
+    const auto results =
+        upsert ? clientA_->BatchUpsert(keys, values, ReplicateConfig{})
+               : clientA_->BatchPut(keys, values, ReplicateConfig{});
+    const auto elapsed = std::chrono::steady_clock::now() - start;
+    EXPECT_LT(elapsed, std::chrono::milliseconds(1800));
+    ASSERT_EQ(results.size(), keys.size());
+    for (const auto& result : results) {
+        ASSERT_FALSE(result);
+        EXPECT_EQ(result.error(), ErrorCode::RPC_TIMEOUT);
+    }
+    EXPECT_EQ(clientA_->PendingNotifyEntryCountForTest(), keys.size());
+    EXPECT_EQ(clientA_->PendingNotifyBucketCountForTest(), 1);
+    clientB_->PauseRebuildNotifiesForTest(false);
+    for (int attempt = 0;
+         attempt < 100 && clientA_->PendingNotifyBucketCountForTest() != 0;
+         ++attempt)
+        std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    EXPECT_EQ(clientA_->PendingNotifyBucketCountForTest(), 0);
+    for (const auto& key : keys)
+        EXPECT_TRUE(
+            GetAndVerify(clientA_, *allocA_, key, std::string(128, 'V')));
+    allocA_->deallocate(buffer, 128);
+}
+
+INSTANTIATE_TEST_SUITE_P(PutAndUpsert, ClientBatchNotifyTest,
+                         ::testing::Bool());
+
+class ClientUpsertHotCacheRebuildTest
+    : public ClientCrossNotifyTest,
+      public ::testing::WithParamInterface<bool> {
+   protected:
+    void SetUp() override {
+        if (const char* value = std::getenv("MC_STORE_LOCAL_HOT_CACHE_SIZE"))
+            previous_size_ = value;
+        if (const char* value = std::getenv("MC_STORE_LOCAL_HOT_BLOCK_SIZE"))
+            previous_block_size_ = value;
+        ::setenv("MC_STORE_LOCAL_HOT_CACHE_SIZE", "1048576", 1);
+        ::setenv("MC_STORE_LOCAL_HOT_BLOCK_SIZE", "4096", 1);
+        ClientCrossNotifyTest::SetUp();
+    }
+    void TearDown() override {
+        ClientCrossNotifyTest::TearDown();
+        if (previous_size_)
+            ::setenv("MC_STORE_LOCAL_HOT_CACHE_SIZE", previous_size_->c_str(),
+                     1);
+        else
+            ::unsetenv("MC_STORE_LOCAL_HOT_CACHE_SIZE");
+        if (previous_block_size_)
+            ::setenv("MC_STORE_LOCAL_HOT_BLOCK_SIZE",
+                     previous_block_size_->c_str(), 1);
+        else
+            ::unsetenv("MC_STORE_LOCAL_HOT_BLOCK_SIZE");
+    }
+    std::optional<std::string> previous_size_;
+    std::optional<std::string> previous_block_size_;
+};
+
+TEST_P(ClientUpsertHotCacheRebuildTest,
+       CommitInvalidatesStaleFillBeforeAckFailure) {
+    const std::string key = "upsert-ack-failure";
+    ASSERT_TRUE(PutString(clientA_, *allocA_, key, "old-value"));
+    auto cache = clientA_->GetHotCache();
+    ASSERT_NE(cache, nullptr);
+    HotCachePutToken stale_token;
+    clientA_->SetBeforeUpsertEndForTest([&] {
+        stale_token = cache->AcquirePutToken(key);
+        auto* block = cache->GetFreeBlock();
+        ASSERT_NE(block, nullptr);
+        block->key_ = key;
+        block->size = 9;
+        std::memcpy(block->addr, "old-value", 9);
+        ASSERT_TRUE(cache->PutHotKey(block, stale_token));
+    });
+    clientA_->SetRebuildNotifyTimeoutForTest(std::chrono::milliseconds(300));
+    clientB_->PauseRebuildNotifiesForTest(true);
+    void* buffer = allocA_->allocate(9);
+    std::memcpy(buffer, "new-value", 9);
+    std::vector<Slice> slices{Slice{buffer, 9}};
+    std::vector<std::vector<Slice>> batches{slices};
+    const auto result =
+        GetParam()
+            ? clientA_->BatchUpsert({key}, batches, ReplicateConfig{}).front()
+            : clientA_->Upsert(key, slices, ReplicateConfig{});
+    clientA_->SetBeforeUpsertEndForTest({});
+    ASSERT_FALSE(result);
+    EXPECT_EQ(result.error(), ErrorCode::RPC_TIMEOUT);
+    EXPECT_FALSE(cache->HasHotKey(key));
+    EXPECT_FALSE(cache->IsPutTokenValid(key, stale_token));
+    auto* delayed = cache->GetFreeBlock();
+    ASSERT_NE(delayed, nullptr);
+    delayed->key_ = key;
+    delayed->size = 9;
+    std::memcpy(delayed->addr, "old-value", 9);
+    EXPECT_FALSE(cache->PutHotKey(delayed, stale_token));
+    clientB_->PauseRebuildNotifiesForTest(false);
+    EXPECT_TRUE(GetAndVerify(clientA_, *allocA_, key, "new-value"));
+    allocA_->deallocate(buffer, 9);
+}
+
+INSTANTIATE_TEST_SUITE_P(SingleAndBatch, ClientUpsertHotCacheRebuildTest,
+                         ::testing::Bool());
+
+TEST_F(ClientCrossNotifyTest, AllMoveEntrypointsRejectWithMasterGateDisabled) {
+    const std::string key = "guarded-move";
+    ASSERT_TRUE(PutString(clientA_, *allocA_, key, "source-value"));
+    auto ordinary = ClientTestAccess::Move(*clientB_, key, "127.0.0.1:19201",
+                                           "127.0.0.1:19202");
+    ASSERT_FALSE(ordinary);
+    EXPECT_EQ(ordinary.error(), ErrorCode::UNAVAILABLE_IN_CURRENT_MODE);
+    auto tenant = ClientTestAccess::Move(*clientB_, key, "default",
+                                         "127.0.0.1:19201", "127.0.0.1:19202");
+    ASSERT_FALSE(tenant);
+    EXPECT_EQ(tenant.error(), ErrorCode::UNAVAILABLE_IN_CURRENT_MODE);
+    void* target = allocate_buffer_allocator_memory(kSeg);
+    ASSERT_NE(target, nullptr);
+    ASSERT_TRUE(clientA_->MountSegment(target, kSeg, FLAGS_protocol));
+    const auto task = clientA_->CreateMoveTask(
+        key, "default", "127.0.0.1:19201", "127.0.0.1:19202");
+    ASSERT_TRUE(task);
+    bool failed = false;
+    for (int attempt = 0; attempt < 100; ++attempt) {
+        const auto status = clientA_->QueryTask(*task);
+        if (status && is_finished_status(status->status)) {
+            EXPECT_EQ(status->status, TaskStatus::FAILED);
+            EXPECT_NE(status->message.find(
+                          toString(ErrorCode::UNAVAILABLE_IN_CURRENT_MODE)),
+                      std::string::npos);
+            failed = true;
+            break;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    }
+    EXPECT_TRUE(failed);
+    const auto query = clientA_->Query(key);
+    ASSERT_TRUE(query);
+    ASSERT_EQ(query->replicas.size(), 1);
+    EXPECT_EQ(query->replicas.front()
+                  .get_memory_descriptor()
+                  .buffer_descriptor.transport_endpoint_,
+              clientB_->GetTransportEndpoint());
+    EXPECT_TRUE(GetAndVerify(clientA_, *allocA_, key, "source-value"));
+    EXPECT_TRUE(clientA_->UnmountSegment(target, kSeg));
+}
 
 TEST_F(ClientCrossNotifyTest,
        DelayedOwnershipIsAppliedAfterOwnersFirstSnapshot) {

@@ -72,6 +72,19 @@ class Client {
     void PauseRebuildNotifiesForTest(bool paused) {
         rebuild_notifies_paused_.store(paused);
     }
+    void SetRebuildNotifyTimeoutForTest(std::chrono::milliseconds timeout) {
+        rebuild_notify_timeout_ms_.store(timeout.count());
+    }
+    void SetBeforeUpsertEndForTest(std::function<void()> callback) {
+        before_upsert_end_for_test_ = std::move(callback);
+    }
+    size_t PendingNotifyEntryCountForTest() const {
+        std::lock_guard<std::mutex> lock(pending_notifies_mutex_);
+        size_t count = 0;
+        for (const auto& [request_id, pending] : pending_notifies_)
+            count += pending.entries.size();
+        return count;
+    }
     uint64_t RebuildSnapshotCountForTest() const {
         return rebuild_snapshot_count_.load();
     }
@@ -697,6 +710,7 @@ class Client {
            const std::string& tenant_id = "default");
 
    private:
+    friend struct ClientTestAccess;
     /**
      * @brief Internal helper functions for initialization and data transfer
      */
@@ -819,6 +833,8 @@ class Client {
     tl::expected<void, ErrorCode> RecordCommittedReplicas(
         const std::string& key, const std::string& tenant_id,
         bool memory_committed = true);
+    std::vector<tl::expected<void, ErrorCode>> BatchRecordCommittedReplicas(
+        const std::vector<std::string>& keys, const std::string& tenant_id);
     // Is `ep` one of THIS client's mounted segments' te_endpoint? (Never
     // compare against local_hostname_ -- a segment's te_endpoint =
     // getLocalIpAndPort().)
@@ -869,6 +885,8 @@ class Client {
     std::unordered_map<uint64_t, PendingRebuildNotify> pending_notifies_;
     uint64_t next_notify_id_{1};
     std::condition_variable pending_notifies_cv_;
+    std::atomic<int64_t> rebuild_notify_timeout_ms_{30000};
+    std::function<void()> before_upsert_end_for_test_;
 
     // Segments in graceful unmount: readable by remote peers, not allocatable
     // locally. TE MR remains registered until master confirms removal.
