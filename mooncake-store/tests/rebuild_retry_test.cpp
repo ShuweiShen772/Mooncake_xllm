@@ -27,7 +27,7 @@ struct ScriptedRecovery {
         return {
             [&] { return RunStep(0); }, [&] { return RunStep(1); },
             [&] { return RunStep(2); }, [&] { return RunStep(3); },
-            [&] { return RunStep(4); },
+            [&] { return RunStep(4); }, nullptr,
         };
     }
 };
@@ -94,6 +94,38 @@ TEST(RebuildRetryTest, StaleEpochStopsWithoutRetryOrDone) {
     EXPECT_EQ(result.error(), ErrorCode::INVALID_VERSION);
     EXPECT_EQ(metadata_calls, 1);
     EXPECT_EQ(done_calls, 0);
+}
+
+TEST(RebuildRetryTest, StaleViewRefreshesAndRetriesWholeTransaction) {
+    RebuildRecoveryOps ops;
+    int refresh_calls = 0;
+    int remount_calls = 0;
+    int metadata_calls = 0;
+    ops.remount = [&]() -> tl::expected<void, ErrorCode> {
+        ++remount_calls;
+        return {};
+    };
+    ops.publish_segment_descriptor = [] {
+        return tl::expected<void, ErrorCode>{};
+    };
+    ops.publish_rpc_metadata = ops.publish_segment_descriptor;
+    ops.resend_metadata = [&]() -> tl::expected<void, ErrorCode> {
+        ++metadata_calls;
+        if (metadata_calls == 1)
+            return tl::make_unexpected(ErrorCode::INVALID_VERSION);
+        return {};
+    };
+    ops.signal_complete = []() -> tl::expected<void, ErrorCode> { return {}; };
+    ops.refresh_view = [&]() {
+        ++refresh_calls;
+        return true;
+    };
+
+    auto result = RunRebuildRecovery(ops, 3, [](int) { return true; });
+    ASSERT_TRUE(result.has_value());
+    EXPECT_EQ(refresh_calls, 1);
+    EXPECT_EQ(remount_calls, 2);
+    EXPECT_EQ(metadata_calls, 2);
 }
 
 TEST(RebuildRetryTest, ShutdownInterruptsRetries) {

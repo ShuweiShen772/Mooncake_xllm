@@ -918,7 +918,15 @@ bool RebuildSameMemoryLocation(const Replica::Descriptor& a,
            da.buffer_address_ == db.buffer_address_ && da.size_ == db.size_ &&
            da.allocation_size_ == db.allocation_size_;
 }
+
 }  // namespace
+
+void MasterService::AdvanceReplicaIdHighWaterMark(ReplicaID next_id) {
+    auto current = Replica::next_id_.load();
+    while (current < next_id &&
+           !Replica::next_id_.compare_exchange_weak(current, next_id)) {
+    }
+}
 
 bool MasterService::ReplicaAlreadyPresent(
     const ObjectMetadata& meta, const Replica::Descriptor& descriptor) const {
@@ -952,10 +960,7 @@ std::optional<Replica> MasterService::DescriptorToReplica(
     buffer->setAllocationEpoch(descriptor.allocation_epoch_);
     Replica replica(std::move(buffer), ReplicaStatus::COMPLETE);
     replica.id_ = desc.id;
-    auto next_id = Replica::next_id_.load();
-    while (next_id <= desc.id &&
-           !Replica::next_id_.compare_exchange_weak(next_id, desc.id + 1)) {
-    }
+    AdvanceReplicaIdHighWaterMark(desc.id + 1);
     return replica;
 }
 
@@ -981,6 +986,10 @@ auto MasterService::RebuildMetadata(const std::vector<KeyReplicaEntry>& entries,
                 incoming_version =
                     std::max(incoming_version,
                              RebuildVersion{buffer.allocation_epoch_, desc.id});
+        }
+        if (incoming_version.first == view_version_ &&
+            incoming_version.second != std::numeric_limits<ReplicaID>::max()) {
+            AdvanceReplicaIdHighWaterMark(incoming_version.second + 1);
         }
         auto accessor = std::make_unique<MetadataAccessorRW>(this, oid);
         if (accessor->Exists()) {

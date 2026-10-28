@@ -4084,6 +4084,25 @@ void Client::StorageHeartbeatThreadMain() {
                     tl::make_unexpected(ErrorCode::RPC_TIMEOUT)};
             return master_client_.SignalRebuildComplete(view_version);
         };
+        ops.refresh_view = [&]() {
+            if (leader_coordinator_) {
+                auto current_view = leader_coordinator_->ReadCurrentView();
+                if (!current_view || !current_view.value().has_value()) {
+                    return false;
+                }
+                if (SwitchLeader(current_view.value().value()) !=
+                    ErrorCode::OK) {
+                    return false;
+                }
+            }
+            std::lock_guard<std::mutex> lock(leader_switch_mutex_);
+            if (!current_master_view_.has_value() ||
+                current_master_view_->view_version == view_version) {
+                return false;
+            }
+            view_version = current_master_view_->view_version;
+            return true;
+        };
         auto result = RunRebuildRecovery(ops, kMaxAttempts, wait_before_retry);
         if (result) {
             rebuild_retry_pending_.store(false);
@@ -4092,8 +4111,9 @@ void Client::StorageHeartbeatThreadMain() {
             return;
         }
         if (result.error() == ErrorCode::INVALID_VERSION) {
-            rebuild_retry_pending_.store(false);
-            LOG(WARNING) << "Aborting stale rebuild view=" << view_version;
+            LOG(WARNING) << "HA metadata rebuild remains pending after stale view="
+                         << view_version
+                         << "; waiting for the current view to be retried";
             return;
         }
         LOG(ERROR) << "HA metadata rebuild attempt exhausted: "

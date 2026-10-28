@@ -14,6 +14,7 @@ struct RebuildRecoveryOps {
     std::function<tl::expected<void, ErrorCode>()> publish_rpc_metadata;
     std::function<tl::expected<void, ErrorCode>()> resend_metadata;
     std::function<tl::expected<void, ErrorCode>()> signal_complete;
+    std::function<bool()> refresh_view;
 };
 
 tl::expected<void, ErrorCode> RunRebuildRecovery(

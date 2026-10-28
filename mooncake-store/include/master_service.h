@@ -833,6 +833,7 @@ class MasterService {
     // looked up by the descriptor's transport_endpoint_. Returns nullopt on
     // failure (segment not mounted / not OK / unknown type).
     std::optional<Replica> DescriptorToReplica(const Replica::Descriptor& desc);
+    static void AdvanceReplicaIdHighWaterMark(ReplicaID next_id);
     // ReplicaAlreadyPresent is declared after ObjectMetadata is defined (it
     // takes const ObjectMetadata&, a private nested type). See below.
 

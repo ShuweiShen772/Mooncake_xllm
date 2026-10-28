@@ -30,8 +30,11 @@ tl::expected<void, ErrorCode> RunRebuildRecovery(
                 }
             }
         }
-        if (last_error == ErrorCode::INVALID_VERSION ||
-            attempt + 1 == max_attempts || !wait_before_retry(attempt)) {
+        if (last_error == ErrorCode::INVALID_VERSION &&
+            (!ops.refresh_view || !ops.refresh_view())) {
+            return tl::make_unexpected(last_error);
+        }
+        if (attempt + 1 == max_attempts || !wait_before_retry(attempt)) {
             return tl::make_unexpected(last_error);
         }
     }

@@ -213,5 +213,43 @@ TEST(MasterRebuildReplayTest, FullSegmentSurvivesLostCompletionAndLaterWrites) {
     }
 }
 
+TEST(MasterRebuildReplayTest, SharedWriteTokenAdvancesNextReplicaId) {
+    const auto config = MasterServiceConfig::builder()
+                            .set_memory_allocator(BufferAllocatorType::OFFSET)
+                            .set_view_version(0)
+                            .set_default_kv_lease_ttl(60000)
+                            .build();
+    MasterService recovered(config);
+    const UUID client_id = generate_uuid();
+    std::vector<unsigned char> bytes(4096);
+    Segment segment;
+    segment.id = generate_uuid();
+    segment.name = "shared-token-owner";
+    segment.te_endpoint = segment.name;
+    segment.base = reinterpret_cast<uint64_t>(bytes.data());
+    segment.size = bytes.size();
+    ASSERT_TRUE(recovered.ReMountSegment({segment}, client_id));
+
+    KeyReplicaEntry entry;
+    entry.key = "recovered-key";
+    entry.size = 128;
+    entry.version = {0, 100000};
+    Replica::Descriptor descriptor;
+    descriptor.id = 7;
+    descriptor.status = ReplicaStatus::COMPLETE;
+    MemoryDescriptor memory;
+    memory.buffer_descriptor = {128, segment.base, "tcp", segment.te_endpoint,
+                                0, 128};
+    descriptor.descriptor_variant = memory;
+    entry.replicas = {descriptor};
+
+    ASSERT_TRUE(recovered.RebuildMetadata({entry}, client_id));
+    auto replacement = recovered.PutStart(client_id, "new-key", "default",
+                                          128, ReplicateConfig{});
+    ASSERT_TRUE(replacement);
+    ASSERT_EQ(replacement->size(), 1);
+    EXPECT_GT(replacement->front().id, entry.version.second);
+}
+
 }  // namespace
 }  // namespace mooncake
